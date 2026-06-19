@@ -16,6 +16,11 @@ import { logTaskError, logTaskProgress, logTaskStart, logTaskSuccess } from '../
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const STORAGE_ROOT = process.env.STORAGE_PATH || path.resolve(__dirname, '../../../data/static')
 const DATA_ROOT = path.resolve(__dirname, '../../../data')
+
+// ffmpeg 二进制路径：优先环境变量，否则依赖系统 PATH
+const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg'
+if (process.env.FFMPEG_PATH) ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH)
+if (process.env.FFPROBE_PATH) ffmpeg.setFfprobePath(process.env.FFPROBE_PATH)
 let subtitleFilterSupport: boolean | null = null
 const IGNORE_TTS_SPEAKERS = /^(环境音|环境声|音效|效果音|sfx|sound ?effect|bgm|背景音|背景音乐|ambient)$/i
 const IGNORE_TTS_TEXT = /^(无|无对白|无台词|无旁白|无需配音|无需对白|none|null|n\/a|na|环境音|环境声|音效|效果音|纯音效|纯环境音|只有环境音|仅环境音|背景音|背景音乐|bgm|sfx|ambient)$/i
@@ -26,10 +31,16 @@ function toAbsPath(relativePath: string): string {
   return path.join(STORAGE_ROOT, relativePath)
 }
 
+// 提取合成失败的真实原因，截断后写入 DB 供前端展示
+function truncateError(err: any): string {
+  const msg = err?.stderr ? `${err.message ?? ''} | ${err.stderr}` : String(err?.message ?? err ?? 'unknown error')
+  return msg.replace(/\s+/g, ' ').trim().slice(0, 500) || 'unknown error'
+}
+
 function supportsSubtitleFilter(): boolean {
   if (subtitleFilterSupport != null) return subtitleFilterSupport
   try {
-    const output = execFileSync('ffmpeg', ['-hide_banner', '-filters'], { encoding: 'utf8' })
+    const output = execFileSync(FFMPEG_BIN, ['-hide_banner', '-filters'], { encoding: 'utf8' })
     subtitleFilterSupport = /\bsubtitles\b/.test(output)
   } catch {
     subtitleFilterSupport = false
@@ -170,7 +181,7 @@ export async function composeStoryboard(storyboardId: number): Promise<string> {
     })
 
     const composedRelative = `static/composed/${outputFilename}`
-    db.update(schema.storyboards).set({ composedVideoUrl: composedRelative, status: 'compose_completed', updatedAt: now() })
+    db.update(schema.storyboards).set({ composedVideoUrl: composedRelative, status: 'compose_completed', composeError: null, updatedAt: now() })
       .where(eq(schema.storyboards.id, storyboardId)).run()
 
     logTaskSuccess('ComposeTask', 'storyboard-compose', {
@@ -179,9 +190,10 @@ export async function composeStoryboard(storyboardId: number): Promise<string> {
       output: composedRelative,
     })
     return composedRelative
-  } catch (err) {
+  } catch (err: any) {
+    const composeError = truncateError(err)
     db.update(schema.storyboards)
-      .set({ status: 'compose_failed', composedVideoUrl: null, updatedAt: now() })
+      .set({ status: 'compose_failed', composedVideoUrl: null, composeError, updatedAt: now() })
       .where(eq(schema.storyboards.id, storyboardId))
       .run()
     throw err

@@ -123,6 +123,7 @@ export const storyboards = sqliteTable('storyboards', {
   ttsAudioUrl: text('tts_audio_url'),
   subtitleUrl: text('subtitle_url'),
   composedVideoUrl: text('composed_video_url'),
+  composeError: text('compose_error'),
   status: text('status').default('pending'),
   createdAt: text('created_at').notNull(),
   updatedAt: text('updated_at').notNull(),

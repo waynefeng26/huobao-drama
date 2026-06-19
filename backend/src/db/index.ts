@@ -358,6 +358,7 @@ function ensureColumn(table: string, column: string, definition: string) {
 ensureColumn('episodes', 'image_config_id', 'INTEGER')
 ensureColumn('episodes', 'video_config_id', 'INTEGER')
 ensureColumn('episodes', 'audio_config_id', 'INTEGER')
+ensureColumn('storyboards', 'compose_error', 'TEXT')
 
 export const db = drizzle(sqlite, { schema })
 export { schema }
