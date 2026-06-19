@@ -1,22 +1,39 @@
 // ============================================================
-// 火宝短剧：原始剧本 → 一集成片 全自动工作流（v2 修正可复用版）
+// 火宝短剧：原始剧本 → 一集成片 全自动工作流（v4：三道质检闸门 + 分数回退回滚 + 默认首尾帧）
 // 复用方法：只改下面 SCRIPT_TITLE / STYLE / SCRIPT_TEXT 三个常量即可跑别的剧本。
 // ⚠️ 不要用 args 传剧本（本环境里 args 会变 undefined，v1 就是这么坏的）。
 // 依赖：火宝后端在 http://localhost:5679 运行，4 类 AI 服务已在「设置」配好。
 // 音频修复在后端 ffmpeg-compose.ts（无对白镜保留视频原生音轨），本工作流自动受益。
+//
+// v4 新增（对标 gstack review gate / ArcReel 阶段间确认）：
+//   1) 三道质量闸门 —— 剧本改写(Rewrite-Gate)、分镜(Storyboard-Gate)、出图前(Images-Gate)
+//      各插入一个【独立 reviewer agent，只读不写】，按维度评审；不通过则把意见回灌给生成方返工。
+//      生成≠评审，正是软件工程「开发 ≠ 代码评审」的分工。
+//   2) 分数回退回滚保护 —— 返工前快照当前版；若返工后复审分数 < 返工前，则用快照回滚后端到上一版并停止
+//      （避免 LLM 非确定性导致「越改越差」）。三道闸门共用 qualityGate() 控制流。
+//   3) 默认首尾帧 —— 每镜生成 first_frame + last_frame 两张图，视频走 Seedance first_last 模式在两帧间
+//      插值，运动起止明确、对叙事镜头（飞跃/摔落/转头）更可控。代价：每镜多 1 张图（成本/时间约翻倍）。
+//   返工安全性：script_rewriter 的 saveScript、storyboard_breaker 的 saveStoryboards 都是覆盖式保存，
+//   重跑不会重复累积；Images 闸门放在【烧图之前】只审 prompt/reference（文本 critic 看不了图），
+//   所以三道闸门的回滚都不需要改后端。
 // ============================================================
 export const meta = {
   name: 'huobao-produce-drama',
-  description: '端到端驱动火宝后端，把一个原始剧本自动做成一集成片（改写→提取→音色→分镜→图→配音→视频→合成→导出）',
+  description: '端到端驱动火宝后端，把一个原始剧本自动做成一集成片（改写→提取→音色→分镜→图→配音→视频→合成→导出），含三道质检闸门 + 回滚保护 + 首尾帧',
   phases: [
     { title: 'Setup', detail: '建剧建集 + 写入原始内容' },
-    { title: 'Rewrite', detail: 'script_rewriter 改写' },
+    { title: 'Rewrite', detail: 'script_rewriter 改写初版' },
+    { title: 'Rewrite-Gate', detail: '剧本质检闸门：critic→返工→分数回退则回滚' },
     { title: 'Extract', detail: 'extractor 提取角色与场景' },
     { title: 'Voice', detail: '直接分配 shimmer/fable + 试听验证' },
-    { title: 'Storyboard', detail: 'storyboard_breaker 拆分镜' },
-    { title: 'Images', detail: '角色图+场景图+每镜首帧' },
+    { title: 'Storyboard', detail: 'storyboard_breaker 拆分镜（初版）' },
+    { title: 'Storyboard-Gate', detail: '分镜质检闸门：critic→返工→分数回退则回滚' },
+    { title: 'Images', detail: '角色图 + 场景图' },
+    { title: 'Images-Gate', detail: '出图前质检：image_prompt + reference 绑定（省钱闸门）' },
+    { title: 'Images-LastFrame-Prompt', detail: '为每镜推导尾帧 prompt（镜头结束画面）' },
+    { title: 'Images-Frames', detail: '每镜生成首帧 + 尾帧（默认 first_last）' },
     { title: 'TTS', detail: '逐镜配音' },
-    { title: 'Video', detail: '逐镜图生视频（瓶颈，长轮询）' },
+    { title: 'Video', detail: '逐镜 first_last 图生视频（首尾帧插值）' },
     { title: 'Compose', detail: '逐镜合成' },
     { title: 'Merge', detail: '整集导出' },
   ],
@@ -34,7 +51,7 @@ const POLL = `
 轮询技巧（单次 Bash 不要超过 ~560 秒；需要就多调几次）：
   curl -s http://localhost:5679/api/v1/videos/$ID | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);console.log(j.data?.status, j.data?.video_url||j.data?.local_path||'')}catch(e){console.log('ERR',s.slice(0,200))}})"
 轮询循环示例：for i in $(seq 1 25); do <check>; <all done> && break; sleep 20; done
-后端在后台轮询厂商（图片 5s/最多10min，视频 10s/最多50min），完成后自动写回 character.image_url / scene.image_url / storyboard.first_frame_image / storyboard.video_url。你只需触发 + 轮询状态 + 核实，不要自己调厂商 API。`
+后端在后台轮询厂商（图片 5s/最多10min，视频 10s/最多50min），完成后自动写回 character.image_url / scene.image_url / storyboard.first_frame_image / storyboard.last_frame_image / storyboard.video_url。你只需触发 + 轮询状态 + 核实，不要自己调厂商 API。`
 
 const STATUS = {
   type: 'object',
@@ -49,6 +66,66 @@ const STATUS = {
   required: ['ok', 'phase', 'details'],
 }
 
+// ===== 质检闸门共用 schema =====
+const CRITIC = {
+  type: 'object',
+  description: '质检结论（独立 reviewer agent 输出，只读不写）',
+  properties: {
+    pass: { type: 'boolean', description: 'true 当且仅当无 high 严重度问题' },
+    score: { type: 'number', description: '0-100 综合质量分' },
+    summary: { type: 'string' },
+    issues: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          severity: { type: 'string', enum: ['high', 'medium', 'low'] },
+          storyboard_id: { type: 'number', description: '相关条目 id（镜头/剧本无对应概念时填 0）' },
+          issue: { type: 'string' },
+        },
+        required: ['severity', 'issue'],
+      },
+    },
+    fix_instructions: { type: 'string', description: '写给生成方的逐条修正指令；因重新保存多为覆盖式，须给出完整修正后的产出要求，而非只说改动' },
+  },
+  required: ['pass', 'score', 'issues', 'fix_instructions'],
+}
+
+// 返工前快照（分数回退时用它回滚）
+const SNAPSHOT = {
+  type: 'object',
+  description: '返工前的数据快照（用于分数回退时回滚到上一版）',
+  properties: {
+    ok: { type: 'boolean' },
+    data: { type: 'string', description: '完整的当前数据快照：GET 原始结果的 JSON 字符串，务必包含所有条目与字段，不要省略任何一项' },
+  },
+  required: ['ok', 'data'],
+}
+
+// 尾帧 prompt 推导结果（每镜一条）
+const LASTFRAME_MAP = {
+  type: 'object',
+  description: '每镜的尾帧 image prompt（镜头结束画面）',
+  properties: {
+    ok: { type: 'boolean' },
+    frames: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          storyboard_id: { type: 'number' },
+          last_prompt: { type: 'string', description: '英文尾帧 prompt，呈现该镜结束瞬间的画面' },
+        },
+        required: ['storyboard_id', 'last_prompt'],
+      },
+    },
+  },
+  required: ['ok', 'frames'],
+}
+
+// 返工上限：critic 最多评审 MAX_REWORK+1 次，rework 最多 MAX_REWORK 次。
+const MAX_REWORK = 2
+
 function common(dramaId, epId) {
   return `
 你在驱动一个【正在运行】的火宝后端：http://localhost:5679 （已确认在线）。
@@ -62,15 +139,53 @@ function common(dramaId, epId) {
 - POST /agent/:type/chat  body {message, drama_id:${dramaId}, episode_id:${epId}}  (:type ∈ script_rewriter|extractor|voice_assigner|storyboard_breaker)  返回 {text,toolResults}；agent 经工具自动落库
 - PUT /characters/:id  body {voice_style, appearance, ...} ；POST /characters/:id/generate-voice-sample {episode_id:${epId}} ；POST /characters/batch-generate-images {character_ids:[..], episode_id:${epId}}
 - POST /scenes/:id/generate-image {episode_id:${epId}}
-- POST /images {storyboard_id, drama_id:${dramaId}, prompt, size, frame_type, reference_images:[..]} ；GET /images/:id
-- POST /storyboards/:id/generate-tts  (同步)
-- POST /videos {storyboard_id, drama_id:${dramaId}, prompt, reference_mode, image_url, duration, aspect_ratio} ；GET /videos/:id
+- POST /images {storyboard_id, drama_id:${dramaId}, prompt, size, frame_type:first_frame|last_frame, reference_images:[..]} ；GET /images/:id  （frame_type 决定写回 storyboard.first_frame_image 还是 last_frame_image）
+- POST /storyboards/:id/generate-tts  (同步) ；PUT /storyboards/:id  body {image_prompt, video_prompt, dialogue, duration, scene_id, ...} ；DELETE /storyboards/:id
+- POST /videos {storyboard_id, drama_id:${dramaId}, prompt, reference_mode:single|first_last|multiple, image_url, first_frame_url, last_frame_url, duration, aspect_ratio} ；GET /videos/:id  （reference_mode:first_last 用 first_frame_url+last_frame_url 让 Seedance 在两帧间插值）
 - POST /compose/episodes/${epId}/compose-all ；GET /compose/episodes/${epId}/compose-status
 - POST /merge/episodes/${epId}/merge ；GET /merge/episodes/${epId}/merge
 注意：本系统 image/video/audio 全部走 api.chatfire.site 中转（已验证可用）；音色库同步不可用（chatfire 不代理 /get_voice），所以音色用直接分配（见 Voice 阶段）。
-⚠️ 编码（重要）：Windows 上 curl -d '...' 直接放中文会变乱码（curl 按 ANSI/GBK 重编码，与 bash locale 无关）。凡是请求 body 含中文（建剧 title/style、写 content、改 character.appearance、改 dialogue 等），一律用【Write 工具写一个 .mjs 用 node 的 fetch 发请求】或【Write 一个 body.json 再 curl -d @body.json】，绝不要把中文直接写进 curl -d。读数据用 curl|node 没问题（响应是 UTF-8 JSON）。
+⚠️ 编码（重要）：Windows 上 curl -d '...' 直接放中文会变乱码（curl 按 ANSI/GBK 重编码，与 bash locale 无关）。凡是请求 body 含中文（建剧 title/style、写 content、改 character.appearance、改 dialogue/image_prompt 等），一律用【Write 工具写一个 .mjs 用 node 的 fetch 发请求】或【Write 一个 body.json 再 curl -d @body.json】，绝不要把中文直接写进 curl -d。读数据用 curl|node 没问题（响应是 UTF-8 JSON）。
 ${POLL}
 原则：每步【触发→核实】，失败就重试或如实上报 ok:false，不要跳过核实。`
+}
+
+// ===== 通用质量闸门 helper：critic 评审 → 不过则返工 → 若返工使分数回退则回滚上一版并停止 =====
+// 三个阶段（剧本/分镜/出图前）共用此控制流，各自通过 4 个 prompt 生成函数注入差异：
+//   criticFor(attempt)      → reviewer 评审当前版的 prompt（输出 CRITIC）
+//   reworkFor(critique,n)   → 生成方按评审意见返工的 prompt（输出 STATUS）
+//   snapshotFor()           → 返工前快照当前版的 prompt（输出 SNAPSHOT，data 存完整 JSON）
+//   rollbackFor(snapData)   → 用快照把后端恢复到上一版的 prompt（输出 STATUS）
+// 控制流（贪心 + 回退保护）：
+//   critic 评审当前版 → 通过则结束；否则循环最多 MAX_REWORK 轮：
+//     返工前快照 → 返工 → 复审 → 若复审分 < 返工前分（回退）→ 回滚后端 + 停止；
+//     否则接受新版，通过则结束，否则下一轮。
+async function qualityGate({ tag, criticFor, reworkFor, snapshotFor, rollbackFor }) {
+  const P = `${tag}-Gate`
+  let critique = await agent(criticFor(0), { phase: P, label: `${tag}-critic-1`, agentType: 'general-purpose', schema: CRITIC, effort: 'high' })
+  log(`${tag} 闸门 · 初版评审：${critique.pass ? '✅ 通过' : '❌ 不通过'} · ${critique.score}/100 · 问题 ${(critique.issues || []).length} 个`)
+  if (critique.pass) return { critique, reworkRounds: 0, rolledBack: false }
+
+  for (let attempt = 0; attempt < MAX_REWORK; attempt++) {
+    const prevScore = critique.score
+    // 返工前快照（分数回退时用它回滚）
+    const snap = await agent(snapshotFor(), { phase: P, label: `${tag}-snap-${attempt + 1}`, agentType: 'general-purpose', schema: SNAPSHOT, effort: 'low' })
+    // 执行返工
+    await agent(reworkFor(critique, attempt), { phase: P, label: `${tag}-rework-${attempt + 1}`, agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
+    // 复审
+    const after = await agent(criticFor(attempt + 1), { phase: P, label: `${tag}-critic-${attempt + 2}`, agentType: 'general-purpose', schema: CRITIC, effort: 'high' })
+    log(`${tag} 闸门 · 第 ${attempt + 1} 轮返工后复审：${after.pass ? '✅ 通过' : '❌ 不通过'} · ${after.score}/100（上版 ${prevScore}）`)
+    if (after.score < prevScore) {
+      log(`${tag} 闸门 · ⚠️ 返工使分数回退（${prevScore} → ${after.score}），回滚到上一版并停止返工`)
+      await agent(rollbackFor(snap.data), { phase: P, label: `${tag}-rollback-${attempt + 1}`, agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
+      // critique 维持为「上一版」（回滚后后端 = 上一版），如实反映
+      return { critique, reworkRounds: attempt, rolledBack: true }
+    }
+    critique = after
+    if (critique.pass) return { critique, reworkRounds: attempt + 1, rolledBack: false }
+  }
+  log(`${tag} 闸门 · 达返工上限 ${MAX_REWORK} 轮仍不通过；如实记录质量，继续后续阶段（不卡死流水线）`)
+  return { critique, reworkRounds: MAX_REWORK, rolledBack: false }
 }
 
 // ============ Setup ============
@@ -89,7 +204,7 @@ ${SCRIPT_TEXT}
 1. 建剧（body 含中文，按上面编码要求用 node fetch，别用 curl -d '中文'）：
    用你的 Write 工具创建临时文件 _create_drama.mjs（Write 保证 UTF-8），内容：
      const r=await fetch('http://localhost:5679/api/v1/dramas',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:'${SCRIPT_TITLE}',style:'${STYLE}',total_episodes:1})});const j=await r.json();console.log(JSON.stringify(j.data));
-   然后 `node _create_drama.mjs`，从输出取 id=dramaId、episodes[0].id=episodeId，用完删掉该文件。
+   然后 \`node _create_drama.mjs\`，从输出取 id=dramaId、episodes[0].id=episodeId，用完删掉该文件。
    （该集无锁定配置，系统回退到各类型最高优先级 active 配置：image=gemini, video=volcengine Seedance, audio=minimax, text=chatfire，全部经 chatfire，已验证可用。）
 2. 写原始内容（务必用 node 做 JSON 安全转义，避免中文/引号破坏 payload）：
    SCRIPT='上述剧本全文'; curl -s -X PUT http://localhost:5679/api/v1/episodes/<EPID> -H 'Content-Type: application/json' -d "$(node -e 'process.stdout.write(JSON.stringify({content:process.argv[1]}))' "$SCRIPT")"
@@ -103,7 +218,7 @@ const EP = Number(setup.episodeId)
 const DRAMA = Number(setup.dramaId)
 if (!EP || !DRAMA) throw new Error('Setup 未返回有效 episodeId/dramaId: ' + JSON.stringify(setup))
 
-// ============ Rewrite ============
+// ============ Rewrite（改写初版）============
 phase('Rewrite')
 const rewrite = await agent(`${common(DRAMA, EP)}
 任务：触发 script_rewriter 改写并落库。
@@ -112,6 +227,43 @@ const rewrite = await agent(`${common(DRAMA, EP)}
 3. 若仍空：把 agent 返回 text 里干净的剧本文本，用 node JSON.stringify 构造 body，PUT /episodes/${EP} {script_content:<文本>} 手动写回，再核实。
 返回 ok + 剧本字数。`,
   { phase: 'Rewrite', label: 'rewrite', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
+
+// ============ Rewrite-Gate：剧本质检闸门 ============
+phase('Rewrite-Gate')
+const rewriteGate = await qualityGate({
+  tag: 'Rewrite',
+  criticFor: () => `${common(DRAMA, EP)}
+你是【剧本质检 / 评审编剧】（reviewer agent），只读不写，不调用 /agent，只评审并输出结构化结论。
+原始素材（完整性基准）：
+"""
+${SCRIPT_TEXT}
+"""
+任务：
+1. GET /dramas/${DRAMA}，取该集 script_content（改写后的格式化剧本）。
+2. 按【编剧视角】评审，维度：
+   a. 格式规范：是否有规范场景头（## S编号 | 内景/外景 · 地点 | 时间）？缺=high。
+   b. 对白格式：对白是否「角色名：（状态/表情）台词」？格式错=medium；有剧情却无对白=medium。
+   c. 节奏：每个场景约 30-60 秒内容？过短/过长=medium。
+   d. 完整性：是否完整覆盖原始素材所有关键情节（乡间土路疾驰 → 大叔发现深沟大喊"沟沟沟" → 女骑手加速"收到，Go Go" → 冲向深沟飞跃 → 连人带车摔入沟底扬尘 → 沙尘散去沟底对话"你刚说啥 / 我说有沟啊"）？漏关键情节=high。
+   e. 可拍摄性：动作描写是否具体可视化（而非抽象概述）？过于抽象难拍=medium。
+   f. 角色：出场角色与剧情是否一致、称呼统一？混乱=medium。
+3. 输出 schema：pass（无 high 即 true）/ score(0-100) / issues[{severity,storyboard_id填0,issue}] / fix_instructions（写给 script_rewriter 的完整修正要求；因 saveScript 是覆盖式，须给完整修正后的剧本要求而非只说改动）。
+只评审，绝不修改数据。`,
+  reworkFor: (critique, attempt) => `${common(DRAMA, EP)}
+任务：按【剧本评审意见】让 script_rewriter 重新改写。返工第 ${attempt + 1} 轮（覆盖式保存，输出完整剧本）。
+1. POST /agent/script_rewriter/chat {message:"请根据以下评审意见重新改写为格式化剧本并保存（覆盖式保存，请输出完整剧本）。\n\n评审评分：${critique.score}/100\n评审问题：\n${(critique.issues || []).map((it, i) => `${i + 1}.[${it.severity}] ${it.issue}`).join('\n')}\n\n修正要求：\n${critique.fix_instructions}", drama_id:${DRAMA}, episode_id:${EP}}  （body 含中文，用 node fetch 或 body.json，勿 curl -d 中文）
+2. 核实：GET /dramas/${DRAMA}，script_content 非空且已变化。
+返回 ok + 字数。`,
+  snapshotFor: () => `${common(DRAMA, EP)}
+任务：快照当前剧本（供回滚用）。GET /dramas/${DRAMA}，取该集 script_content 全文，把 JSON.stringify({script_content: <全文>}) 的结果字符串放进 data 字段。务必完整、不要截断。`,
+  rollbackFor: (snapData) => `${common(DRAMA, EP)}
+任务：回滚剧本到快照版本（返工使质量回退，恢复上一版）。
+快照数据（JSON 字符串）：${snapData}
+1. 解析其中的 script_content 全文。
+2. 用 node JSON.stringify 构造 body（中文安全转义，勿 curl -d 中文），PUT /episodes/${EP} {script_content: <快照全文>}。
+3. 核实 GET /dramas/${DRAMA} 的 script_content 已恢复为快照内容。
+返回 ok。`,
+})
 
 // ============ Extract ============
 phase('Extract')
@@ -140,7 +292,7 @@ const voice = await agent(`${common(DRAMA, EP)}
 全部角色已分配有效音色 + 试听成功才算 ok=true。`,
   { phase: 'Voice', label: 'voice', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
 
-// ============ Storyboard ============
+// ============ Storyboard（初版）============
 phase('Storyboard')
 const storyboard = await agent(`${common(DRAMA, EP)}
 任务：触发 storyboard_breaker 拆分镜。
@@ -151,15 +303,113 @@ const storyboard = await agent(`${common(DRAMA, EP)}
 返回 ok + 镜头数。`,
   { phase: 'Storyboard', label: 'storyboard', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
 
-// ============ Images ============
+// ============ Storyboard-Gate：分镜质检闸门（critic → 返工 → 分数回退则回滚）============
+phase('Storyboard-Gate')
+const storyboardGate = await qualityGate({
+  tag: 'Storyboard',
+  criticFor: () => `${common(DRAMA, EP)}
+你是【分镜质检 / 评审导演】（reviewer agent），与 storyboard_breaker 是不同角色——你【只读不写】，不调用任何 /agent，不修改数据，只评审输出结构化结论。
+本集原始剧本（完整性基准）：
+"""
+${SCRIPT_TEXT}
+"""
+任务：
+1. GET /episodes/${EP}/storyboards 拿全部分镜（每镜 id / image_prompt / video_prompt / dialogue / description / duration / shot_type / scene_id / character_ids）。
+2. GET /episodes/${EP}/characters 与 /scenes 拿角色（含 appearance）与场景，判断绑定正确性与跨镜一致性。
+3. 以【导演视角】逐镜评审，维度：
+   a. 完整性：分镜是否覆盖剧本所有关键转折？本例关键节拍是「乡间土路疾驰 → 大叔发现深沟大喊"沟沟沟" → 女骑手加速"收到，Go Go" → 冲向深沟飞跃 → 连人带车摔入沟底扬尘 → 沙尘散去沟底对话"你刚说啥 / 我说有沟啊"」。漏任一=high。
+   b. image_prompt 质量：每镜是否有清晰、英文为主、含构图/人物外貌/景别/光线/氛围的首帧描述（出图质量命根子）？空/纯中文/过笼统=high。
+   c. video_prompt 质量：每镜是否有适配图生视频（Seedance，单镜4-12s）的动作描述？只静态无运动=medium；空=high。
+   d. 对白格式：dialogue 是否「角色名：台词」？格式错或漏角色名=medium（纯动作镜可无对白）。
+   e. 时长：每镜 duration 4-8 秒且合理？普遍>10s 或<3s=medium。
+   f. 绑定：每镜是否绑定正确角色（character_ids）与场景（scene_id）？有对白却没绑说话角色=high。
+   g. 一致性：同一角色跨镜 image_prompt 是否与 appearance 一致（女骑手=年轻女性、黑色短发、机车皮夹克；男骑手=憨厚中年、寸头、旧夹克）？冲突=medium。
+   h. 数量与节奏：镜头数是否合理（本例预期 4-6 镜）？过碎或过冗=medium。
+4. 输出 schema：pass（无 high 即 true）/ score(0-100) / issues[{severity,storyboard_id,issue}] / fix_instructions（逐镜可执行修正指令；因 saveStoryboards 覆盖式，须描述完整修正后的全部分镜而非只说改动）。
+只评审，绝不修改数据。`,
+  reworkFor: (critique, attempt) => `${common(DRAMA, EP)}
+任务：按【分镜评审意见】让 storyboard_breaker 重新拆解并修正（返工第 ${attempt + 1} 轮；saveStoryboards 覆盖式，输出完整修正后的全部分镜）。
+1. POST /agent/storyboard_breaker/chat {message:"请根据以下导演评审意见重新拆解分镜。重新保存会覆盖现有全部分镜，请直接输出完整修正后的全部分镜，不要只说改动。\n\n评审评分：${critique.score}/100\n评审问题：\n${(critique.issues || []).map((it, i) => `${i + 1}.[${it.severity}]${it.storyboard_id ? ' 镜头#' + it.storyboard_id : ''} ${it.issue}`).join('\n')}\n\n逐镜修正指令：\n${critique.fix_instructions}\n\n原始约束：视频模型 doubao-seedance-1-5-pro-251215（Seedance 图生视频，单镜4-12秒）；每镜英文 image_prompt 与 video_prompt；dialogue 用「角色名：台词」；绑定角色与场景；时长4-8秒。", drama_id:${DRAMA}, episode_id:${EP}}
+2. 核实：GET /episodes/${EP}/storyboards 镜头数>0，high 问题已修正。
+返回 ok + 镜头数。`,
+  snapshotFor: () => `${common(DRAMA, EP)}
+任务：快照全部分镜（供回滚用）。GET /episodes/${EP}/storyboards，把完整结果数组（含每镜所有字段：id/storyboard_number/image_prompt/video_prompt/dialogue/description/duration/shot_type/scene_id/character_ids 等）作为 JSON 字符串放进 data 字段。不要省略任何镜头或字段。`,
+  rollbackFor: (snapData) => `${common(DRAMA, EP)}
+任务：回滚分镜到快照版本（返工使质量回退，恢复上一版）。
+快照数据（每镜完整字段 JSON）：${snapData}
+1. 解析快照，得上一版镜头列表（按 storyboard_number 排序）。
+2. GET /episodes/${EP}/storyboards 拿当前镜头列表。
+3. 对快照里每个镜头 s：在当前列表找同 storyboard_number 的镜头 c；若找到，用 node JSON.stringify 构造 body，PUT /storyboards/:c.id 覆盖 image_prompt/video_prompt/dialogue/description/duration/shot_type/scene_id 为 s 的值；若当前缺这镜，记 warning（无法通过 REST 新建）。
+4. 当前列表里 storyboard_number 不在快照中的多余镜头：DELETE /storyboards/:id 删除。
+5. 核实 GET /episodes/${EP}/storyboards 镜头数与快照一致、核心字段已恢复。
+返回 ok + 恢复的镜头数（warn 写进 warnings）。`,
+})
+
+// ============ Images：A+B 角色/场景图 ============
 phase('Images')
-const images = await agent(`${common(DRAMA, EP)}
-任务：生成角色形象图、场景图、每个镜头首帧。
+const imagesAssets = await agent(`${common(DRAMA, EP)}
+任务：生成角色形象图与场景图（镜头首尾帧在闸门通过后单独生成）。
 A. 角色图：GET /episodes/${EP}/characters 拿 ids；POST /characters/batch-generate-images {character_ids:[..], episode_id:${EP}}；轮询 GET /episodes/${EP}/characters 直到每个角色 image_url 有值。
 B. 场景图：GET /episodes/${EP}/scenes；对每个 POST /scenes/:id/generate-image {episode_id:${EP}}；轮询直到 scene.image_url 有值。
-C. 每镜首帧（单帧方式，不用宫格，更稳）：GET /episodes/${EP}/storyboards 拿各镜 image_prompt/character_ids/scene_id。对每镜 POST /images {storyboard_id, drama_id:${DRAMA}, prompt:"<image_prompt或description>, 竖屏9:16, cinematic, high quality", size:"1080x1920", frame_type:"first_frame", reference_images:["<角色image_url>","<场景image_url>"]}。reference_images 用 GET 结果里的 image_url（形如 static/images/xxx.png）。后端生成完自动写 storyboard.first_frame_image。轮询 GET /episodes/${EP}/storyboards 直到每镜 first_frame_image 有值。
-失败逐个重试1次；仍失败记 warning 继续。返回 ok + 角色图/场景图/首帧 的成功计数。`,
-  { phase: 'Images', label: 'images', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
+失败逐个重试1次；仍失败记 warning 继续。返回 ok + 角色图/场景图成功计数。`,
+  { phase: 'Images', label: 'images-assets', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
+
+// ============ Images-Gate：出图前质检（critic 审 image_prompt + reference 绑定，省钱闸门）============
+phase('Images-Gate')
+const imagesGate = await qualityGate({
+  tag: 'Images',
+  criticFor: () => `${common(DRAMA, EP)}
+你是【出图前质检 / 评审美术】（reviewer agent），只读不写。出图很贵，本闸门在【烧图钱之前】审查 prompt 与 reference 是否完备——这是省钱+提质量的关键闸门。
+任务：
+1. GET /episodes/${EP}/storyboards 拿每镜 image_prompt / character_ids / scene_id / description。
+2. GET /episodes/${EP}/characters 与 /scenes，确认角色图 image_url 与场景图 image_url 都已生成（非空）。
+3. 逐镜评审，维度：
+   a. image_prompt 完备：每镜 image_prompt 是否英文为主、含构图/人物外貌（与角色 appearance 一致）/景别/光线/9:16竖屏/cinematic 风格词？空/纯中文/过笼统/缺竖屏风格=high。
+   b. reference 绑定：每镜是否绑定出场角色（character_ids）与场景（scene_id）？有角色出现却没绑=high；没绑场景=medium。
+   c. 角色/场景图就绪：绑定的角色、场景是否都已有 image_url（否则生成时无参考）？缺=high。
+   d. 一致性：image_prompt 对角色外貌描述是否与 appearance 一致（女骑手黑短发机车夹克；男骑手憨厚寸头）？冲突=medium。
+4. 输出 schema：pass（无 high 即 true）/ score(0-100) / issues[{severity,storyboard_id,issue}] / fix_instructions（逐镜指令：哪些镜要 PUT 改 image_prompt、要补绑哪些 character_ids/scene_id；image_prompt 是单字段覆盖，指令须给完整新 image_prompt 文本）。
+只评审，绝不生成图、不修改数据。`,
+  reworkFor: (critique, attempt) => `${common(DRAMA, EP)}
+任务：按【出图评审意见】修正镜头 image_prompt 与绑定（返工第 ${attempt + 1} 轮）。⚠️ 只改 prompt 文本与绑定字段，【不要】生成图片（图片在闸门通过后才统一生成）。
+评审问题：
+${(critique.issues || []).map((it, i) => `${i + 1}.[${it.severity}]${it.storyboard_id ? ' 镜头#' + it.storyboard_id : ''} ${it.issue}`).join('\n')}
+修正指令：
+${critique.fix_instructions}
+执行：对每条指令，用 node JSON.stringify 构造 body（中文安全转义，勿 curl -d 中文），PUT /storyboards/:id 按指令覆盖 {image_prompt, scene_id} 等字段。核实 GET。返回 ok + 修正的镜头数。`,
+  snapshotFor: () => `${common(DRAMA, EP)}
+任务：快照每镜 image_prompt（供回滚用）。GET /episodes/${EP}/storyboards，把 [{id, storyboard_number, image_prompt, scene_id}] 的 JSON 字符串放进 data。完整不要省略。`,
+  rollbackFor: (snapData) => `${common(DRAMA, EP)}
+任务：回滚镜头 image_prompt 到快照版本（返工使质量回退）。
+快照（每镜 id + image_prompt + scene_id JSON）：${snapData}
+对快照里每镜，用 node JSON.stringify 构造 body，PUT /storyboards/:id {image_prompt: <快照值>, scene_id: <快照值>} 恢复。核实 GET。返回 ok。`,
+})
+
+// ============ Images-LastFrame-Prompt：为每镜推导尾帧 prompt（镜头结束画面）============
+phase('Images-LastFrame-Prompt')
+const lastFramePrompts = await agent(`${common(DRAMA, EP)}
+任务：为每个镜头推导【尾帧 prompt】（镜头结束画面），用于生成视频的最后一帧。首帧=镜头开始（image_prompt），尾帧=镜头结束；Seedance 会在首尾两帧间插值出运动，所以尾帧要描述"这一镜结束时画面是什么样"。
+1. GET /episodes/${EP}/storyboards，拿每镜 id / image_prompt / video_prompt / description / action / result。
+2. 对每镜：基于 image_prompt（开始画面）+ video_prompt/action/result（运动与结果），推导【镜头结束瞬间】画面，写成英文 image prompt（含构图/人物状态/景别/光线/9:16竖屏/cinematic），与首帧风格一致但呈现结束状态。
+   例：首帧"女骑手加速冲向深沟" → 尾帧"摩托车腾空飞跃在深沟上方，两人悬空，沙尘初起"；首帧"两人坐沟底" → 尾帧"两人坐沟底满身尘土，女骑手转头询问的神态"。
+3. 返回 frames: [{storyboard_id, last_prompt}]，每镜一条。纯静态/无明显运动的镜头，尾帧描述该场景的稳定结束状态即可。
+只推导 prompt 文本，不生成图片。`,
+  { phase: 'Images-LastFrame-Prompt', label: 'lastframe-prompt', agentType: 'general-purpose', schema: LASTFRAME_MAP, effort: 'medium' })
+
+// ============ Images-Frames：每镜生成首帧 + 尾帧（默认 first_last）============
+phase('Images-Frames')
+const framesGen = await agent(`${common(DRAMA, EP)}
+任务：为每个镜头生成【首帧 + 尾帧】两张图（默认首尾帧模式；视频走 Seedance first_last 在两帧间插值，运动更可控）。
+1. GET /episodes/${EP}/storyboards 拿每镜 id / image_prompt / character_ids / scene_id；GET /episodes/${EP}/characters 与 /scenes 拿角色图/场景图 image_url。
+2. 尾帧 prompt 映射（storyboard_id → last_prompt）：
+${JSON.stringify((lastFramePrompts.frames || []).map(f => ({ id: f.storyboard_id, last_prompt: f.last_prompt })))}
+3. 对每镜：
+   - 首帧：POST /images {storyboard_id, drama_id:${DRAMA}, prompt:"<image_prompt>, 竖屏9:16, cinematic, high quality", size:"1080x1920", frame_type:"first_frame", reference_images:["<该镜出场角色 image_url>","<场景 image_url>"]}
+   - 尾帧：POST /images {storyboard_id, drama_id:${DRAMA}, prompt:"<该镜 last_prompt>, 竖屏9:16, cinematic, high quality", size:"1080x1920", frame_type:"last_frame", reference_images:[同首帧]}
+   reference_images 用 GET 结果里的 image_url（形如 static/images/xxx.png）。后端生成完自动写 storyboard.first_frame_image / last_frame_image。body 含中文用 node fetch 或 body.json。
+4. 轮询 GET /episodes/${EP}/storyboards 直到每镜 first_frame_image 与 last_frame_image 都有值。
+失败逐个重试1次；尾帧实在失败的可记 warning 跳过（视频阶段会降级为仅首帧）。返回 ok + 首帧/尾帧成功计数。`,
+  { phase: 'Images-Frames', label: 'images-frames', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
 
 // ============ TTS ============
 phase('TTS')
@@ -172,25 +422,28 @@ const tts = await agent(`${common(DRAMA, EP)}
   { phase: 'TTS', label: 'tts', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
 
 // ===== 安全闸门：前置若失败，绝不动视频（最贵）=====
-const gateOk = rewrite.ok && extract.ok && voice.ok && storyboard.ok && images.ok && tts.ok
+const gateOk = rewrite.ok && extract.ok && voice.ok && storyboard.ok && imagesAssets.ok && framesGen.ok && tts.ok
 if (!gateOk) {
   return {
     aborted: true,
     reason: '前置阶段有失败（见各 phase.ok），为避免在视频阶段白花 API 费用，已中止。',
     episodeId: EP, dramaId: DRAMA,
-    phases: { rewrite, extract, voice, storyboard, images, tts },
+    phases: { rewrite, rewriteGate, extract, voice, storyboard, storyboardGate, imagesAssets, imagesGate, lastFramePrompts, framesGen, tts },
   }
 }
 
-// ============ Video ============
+// ============ Video（first_last 首尾帧插值；无尾帧降级 single）============
 phase('Video')
 const video = await agent(`${common(DRAMA, EP)}
-任务：每镜图生视频（火山 Seedance，最贵最慢）。TTS/图片已就绪，可放心跑。
-1. GET /episodes/${EP}/storyboards，拿每镜 video_prompt/description/duration/first_frame_image。
-2. 对每个【有 first_frame_image】的镜：POST /videos {storyboard_id, drama_id:${DRAMA}, prompt:"<video_prompt或description>", reference_mode:"single", image_url:"<first_frame_image, static/..>", duration:<4-8>, aspect_ratio:"9:16"}。分批触发（每批2-3个）降低限流；记录每个 video generation id。
-3. 轮询所有 video id GET /videos/:id 直到 status=completed 且有 video_url/local_path，或 failed。单次 Bash sleep20/最多~25次（约8分钟），需要多次。总上限~40分钟。
+任务：每镜图生视频（火山 Seedance，最贵最慢）。首尾帧图已就绪，优先用 first_last 模式。
+1. GET /episodes/${EP}/storyboards，拿每镜 video_prompt/description/duration/first_frame_image/last_frame_image。
+2. 对每个镜头：
+   - 同时有 first_frame_image 与 last_frame_image：POST /videos {storyboard_id, drama_id:${DRAMA}, prompt:"<video_prompt或description>", reference_mode:"first_last", first_frame_url:"<first_frame_image>", last_frame_url:"<last_frame_image>", duration:<4-8>, aspect_ratio:"9:16"}  ← 默认首选，两帧间插值运动更可控。
+   - 仅 first_frame_image（无尾帧）：降级 POST /videos {... reference_mode:"single", image_url:"<first_frame_image>"}。
+   分批触发（每批2-3个）降低限流；记录每个 video generation id。
+3. 轮询所有 video id GET /videos/:id 直到 status=completed 且有 video_url/local_path，或 failed。总上限~40分钟。
 4. failed 的重试1次。
-返回 ok + 成功/失败计数。全部失败（key/余额）则 ok:false 并说明。`,
+返回 ok + 成功/失败计数 + 用了 first_last 模式的镜头数。全部失败（key/余额）则 ok:false 并说明。`,
   { phase: 'Video', label: 'video', agentType: 'general-purpose', schema: STATUS, effort: 'high' })
 
 // ============ Compose ============
@@ -213,8 +466,20 @@ const merge = await agent(`${common(DRAMA, EP)}
 返回 ok + 最终成片 URL（放 details）。`,
   { phase: 'Merge', label: 'merge', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
 
+function gateSummary(g) {
+  return g && g.critique
+    ? { pass: g.critique.pass, score: g.critique.score, reworkRounds: g.reworkRounds, rolledBack: g.rolledBack, issues: g.critique.issues }
+    : null
+}
+
 return {
   episodeId: EP, dramaId: DRAMA, dramaTitle: SCRIPT_TITLE,
-  phases: { rewrite, extract, voice, storyboard, images, tts, video, compose, merge },
+  // 三道质量闸门的最终结果：是否通过、评分、返工几轮、是否触发过回滚、遗留问题。
+  qualityGates: {
+    rewrite: gateSummary(rewriteGate),
+    storyboard: gateSummary(storyboardGate),
+    images: gateSummary(imagesGate),
+  },
+  phases: { rewrite, rewriteGate, extract, voice, storyboard, storyboardGate, imagesAssets, imagesGate, lastFramePrompts, framesGen, tts, video, compose, merge },
   workbench: `http://localhost:3013/drama/${DRAMA}/episode/1`,
 }
