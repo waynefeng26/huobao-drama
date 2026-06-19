@@ -168,9 +168,13 @@ export async function composeStoryboard(storyboardId: number): Promise<string> {
       const outputOptions = ['-c:v', 'libx264', '-preset', 'fast', '-crf', '23']
 
       if (audioPath) {
-        outputOptions.push('-map', '0:v', '-map', '1:a', '-c:a', 'aac', '-shortest')
+        // 有对白：用 TTS 音轨替换视频原音，统一到 44100/stereo 便于 concat 拼接
+        outputOptions.push('-map', '0:v', '-map', '1:a', '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-shortest')
       } else {
-        outputOptions.push('-an')
+        // 无对白：保留视频原生音轨（Seedance 已带环境/音效），统一到 44100/stereo。
+        // 绝不能用 -an 丢掉音频流——否则 concat demuxer 会以首个纯视频片段的流布局为准，
+        // 丢弃后续镜头的音频，导致整集无声。
+        outputOptions.push('-map', '0:v', '-map', '0:a', '-c:a', 'aac', '-ar', '44100', '-ac', '2')
       }
 
       cmd.outputOptions(outputOptions)
