@@ -1,5 +1,5 @@
 // ============================================================
-// 火宝短剧：原始剧本 → 一集成片 全自动工作流（v4：三道质检闸门 + 分数回退回滚 + 默认首尾帧）
+// 火宝短剧：原始剧本 → 一集成片 全自动工作流（v5：v4 基础 + 角色三视图设定图 + 结构化 appearance）
 // 复用方法：只改下面 SCRIPT_TITLE / STYLE / SCRIPT_TEXT 三个常量即可跑别的剧本。
 // ⚠️ 不要用 args 传剧本（本环境里 args 会变 undefined，v1 就是这么坏的）。
 // 依赖：火宝后端在 http://localhost:5679 运行，4 类 AI 服务已在「设置」配好。
@@ -16,6 +16,12 @@
 //   返工安全性：script_rewriter 的 saveScript、storyboard_breaker 的 saveStoryboards 都是覆盖式保存，
 //   重跑不会重复累积；Images 闸门放在【烧图之前】只审 prompt/reference（文本 critic 看不了图），
 //   所以三道闸门的回滚都不需要改后端。
+//
+// v5 新增（角色一致性·三视图）：Extract 把每角色 appearance 改写为【三视图友好】结构化固定特征
+//   （整体/头部/服装/配色/标记），场景 prompt 精准化（地点/时间/光线/氛围/元素/色调）；Images 用
+//   POST /images 为每角色生成【三视图 character sheet】（正/侧/背三视角，自动写入 character.image_url），
+//   镜头首尾帧参考三视图保持人物跨镜一致（单镜只画单一视角）。不改后端——sheet 走 image_url；
+//   若要更精准的「正/侧/背分三张存 referenceImages」，需扩 PUT /characters 白名单 + 生成逻辑，留作后续。
 // ============================================================
 export const meta = {
   name: 'huobao-produce-drama',
@@ -24,11 +30,11 @@ export const meta = {
     { title: 'Setup', detail: '建剧建集 + 写入原始内容' },
     { title: 'Rewrite', detail: 'script_rewriter 改写初版' },
     { title: 'Rewrite-Gate', detail: '剧本质检闸门：critic→返工→分数回退则回滚' },
-    { title: 'Extract', detail: 'extractor 提取角色与场景' },
+    { title: 'Extract', detail: '提取角色与场景 + 结构化 appearance（三视图友好）+ 场景 prompt 精准化' },
     { title: 'Voice', detail: '直接分配 shimmer/fable + 试听验证' },
     { title: 'Storyboard', detail: 'storyboard_breaker 拆分镜（初版）' },
     { title: 'Storyboard-Gate', detail: '分镜质检闸门：critic→返工→分数回退则回滚' },
-    { title: 'Images', detail: '角色图 + 场景图' },
+    { title: 'Images', detail: '角色三视图设定图（character sheet）+ 场景图' },
     { title: 'Images-Gate', detail: '出图前质检：image_prompt + reference 绑定（省钱闸门）' },
     { title: 'Images-LastFrame-Prompt', detail: '为每镜推导尾帧 prompt（镜头结束画面）' },
     { title: 'Images-Frames', detail: '每镜生成首帧 + 尾帧（默认 first_last）' },
@@ -45,7 +51,17 @@ const SCRIPT_TITLE = '摩托车飞跃深沟'
 //   realistic | anime | ghibli | cinematic | comic | watercolor
 //   写实+电影感打光 → cinematic；纯写实 → realistic。不要填中文自由文本。
 const STYLE = 'cinematic'
-const SCRIPT_TEXT = '短发女骑手驾驶摩托车，载着一个憨厚的青年大叔（两人都没带头盔），在乡间土路上疾驰，突然青年大叔发现前面有个深沟，惊讶的大喊，沟 沟 沟。随后短发女骑手加速喊道“收到， Go Go”。随后摩托车高速冲向深沟，女骑手一脸淡定，青年大叔一脸惊讶，最后连人带车摔入沟底，激起大量沙尘。沙尘逐渐散去，两人坐在沟底满身尘土。女骑手率先开口询问：“你刚说啥？”，男骑手气喘吁吁地回答：“我说有沟啊！”'
+
+// ===== 角色参考图（可选）：想让某角色长得像指定图，把参考图放进 data/static/refs/，按「角色名 → [参考图路径]」配置 =====
+// 后端 Gemini adapter 会把参考图作为 inline_data 传给 Gemini 做图生图（gemini-image.ts），让角色贴合参考图。
+// 路径写 static/ 开头（后端自动读取压缩成 data URL）；也可写 http(s):// URL 或 data:image/... 内联；每角色最多 6 张。
+// 角色名要与 Extract 提取的 name 一致（如「女骑手」「男骑手」）；未配置的角色按结构化 appearance 自由生成。
+// 默认空对象 = 全部角色自由生成，不加参考图。
+const CHARACTER_REFERENCES = {
+  // '女骑手': ['static/refs/rider_face.jpg', 'static/refs/rider_outfit.jpg'],
+  // '男骑手': ['static/refs/guy_ref.jpg'],
+}
+const SCRIPT_TEXT = '中国短发美女骑手驾驶摩托车，载着一个憨厚的中国年轻小伙（两人都没带头盔），在乡间土路上疾驰，突然年轻小伙发现前面有个深坑，惊讶的大喊，沟 沟 沟。随后短发女骑手加速喊道“收到， Go Go”。随后摩托车高速冲向深沟，女骑手一脸淡定，年轻小伙一脸惊讶，最后连人带车摔入沟底，激起大量沙尘。沙尘逐渐散去，两人坐在沟底满身尘土。女骑手率先开口询问："你刚说啥？"，男骑手气喘吁吁地回答："我说有沟啊！"'
 
 const POLL = `
 轮询技巧（单次 Bash 不要超过 ~560 秒；需要就多调几次）：
@@ -265,16 +281,24 @@ ${SCRIPT_TEXT}
 返回 ok。`,
 })
 
-// ============ Extract ============
+// ============ Extract（结构化 appearance + 精准场景，为三视图打基础）============
 phase('Extract')
 const extract = await agent(`${common(DRAMA, EP)}
-任务：触发 extractor 提取角色与场景。
-1. POST /agent/extractor/chat {message:"请从剧本中提取所有角色和场景信息，提取时自动与项目已有数据进行去重合并", drama_id:${DRAMA}, episode_id:${EP}}
+任务：触发 extractor 提取角色与场景，然后把每角色 appearance 改写成【三视图友好】结构化描述、把场景 prompt 精准化（这是后续三视图与跨镜一致性的根基）。
+1. POST /agent/extractor/chat {message:"请从剧本中提取所有角色和场景信息，提取时自动与项目已有数据进行去重合并。每个场景的 prompt 请写完整：地点/时间段/光线/氛围/关键元素/色调。", drama_id:${DRAMA}, episode_id:${EP}}
 2. 核实：GET /episodes/${EP}/characters（应有2角色：女骑手、男骑手/青年大叔），GET /episodes/${EP}/scenes（应≥1场景）。
-3. 【重要】检查每角色 appearance 是否详尽（性别/年龄/发型/着装/神态，≥30字）。不足则 PUT /characters/:id {appearance:"<中文外观>"} 补全：
-   女骑手：年轻女性，利落黑色短发，深色机车皮夹克与长裤，神情淡定自信，身材矫健。
-   男骑手（青年大叔）：憨厚中年男性，微胖圆脸，寸头，旧夹克/格子衫，表情丰富易惊讶。
-返回 ok + 角色数/场景数 + 角色 id 列表。`,
+3. 【关键·三视图精准度】对每个角色，用 node JSON.stringify 构造 body（中文安全转义，勿 curl -d 中文），PUT /characters/:id {appearance:"<结构化外观>"}，把 appearance 改写成下面这个【三视图友好】格式——三视图=正/侧/背三个视角都要能锚定的固定特征，是跨镜一致性的命根子，每项要具体到能画出来：
+   【整体】性别/年龄段/体型/身高感
+   【头部】发型(长度/颜色/样式/分缝)、脸型、眉眼、肤色
+   【服装】上装(款式/颜色/材质/领型)、下装、鞋、配饰(头盔?项链?眼镜?)
+   【配色】主色/辅色（跨镜锚定用）
+   【标记】疤痕/纹身/特殊特征（无则写"无"）
+   【神态】默认气质表情
+   参考填充（基于剧本，按此精度）：
+   女骑手：【整体】年轻女性,20岁出头,矫健苗条,中等身高;【头部】利落黑色齐耳短发(自然分缝)、鹅蛋脸、浓眉亮眼、健康肤色;【服装】深色拉链机车皮夹克(黑)、黑色修身长裤、黑色马丁靴;【配色】主色黑/辅色暗银拉链;【标记】无;【神态】淡定自信。
+   男骑手(青年大叔):【整体】憨厚中年男性,35-45岁,微胖圆脸,中等偏矮;【头部】黑色寸头、圆脸、八字眉、偏黄肤色;【服装】旧军绿夹克(内格子衬衫)、深色长裤、旧布鞋;【配色】主色军绿/辅色灰;【标记】无;【神态】易惊讶、表情丰富。
+4. 【场景精准化】GET /episodes/${EP}/scenes，对每个场景用 node JSON.stringify 构造 body，PUT /scenes/:id {prompt:"<精准场景描述>"}，prompt 含【地点/时间段/光线/氛围/关键元素/色调/镜头风格】且可视化。例：乡间土路场景 → "rural dirt road between fields, daytime, harsh sunlight, dry dust, deep ditch ahead, warm earth tones, cinematic wide establishing shot"。
+返回 ok + 角色数/场景数 + 角色 id 列表 + 每角色 appearance 字数。`,
   { phase: 'Extract', label: 'extract', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
 
 // ============ Voice ============
@@ -345,13 +369,17 @@ ${SCRIPT_TEXT}
 返回 ok + 恢复的镜头数（warn 写进 warnings）。`,
 })
 
-// ============ Images：A+B 角色/场景图 ============
+// ============ Images：A+B 角色三视图设定图 + 场景图 ============
 phase('Images')
 const imagesAssets = await agent(`${common(DRAMA, EP)}
-任务：生成角色形象图与场景图（镜头首尾帧在闸门通过后单独生成）。
-A. 角色图：GET /episodes/${EP}/characters 拿 ids；POST /characters/batch-generate-images {character_ids:[..], episode_id:${EP}}；轮询 GET /episodes/${EP}/characters 直到每个角色 image_url 有值。
-B. 场景图：GET /episodes/${EP}/scenes；对每个 POST /scenes/:id/generate-image {episode_id:${EP}}；轮询直到 scene.image_url 有值。
-失败逐个重试1次；仍失败记 warning 继续。返回 ok + 角色图/场景图成功计数。`,
+任务：生成【角色三视图设定图】与场景图（镜头首尾帧在闸门通过后单独生成）。
+A. 角色三视图（character sheet，跨镜一致性的命根子）：GET /episodes/${EP}/characters 拿 ids 与结构化 appearance。⚠️ 不要用 batch-generate-images（那个只出单张正面）。改用【POST /images】为每角色生成一张含三视角的设定图：
+   POST /images {character_id:<id>, drama_id:${DRAMA}, size:"1080x1920", reference_images:<该角色参考图数组，见下一行；无则 []>, prompt:"character design sheet, three views of the same person (front view, side profile view, back view), full body turnaround, <把该角色结构化 appearance 翻译成英文关键特征: 性别/年龄/体型/发型颜色与样式/脸型/服装款式与颜色/鞋/配饰/特殊标记>, consistent character design across all three views, clean white background, professional concept art, cinematic lighting, high quality"}
+   【参考图映射（角色名 → [static 路径...]）】：${JSON.stringify(CHARACTER_REFERENCES)}。生成某角色时，若其 name（GET /characters 返回的）在映射里有参考图，把这些路径放进 reference_images（后端自动读取压缩成 data URL 传给 Gemini 做图生图，让角色长得像参考图）；映射为空 {} 或该角色未配置则 reference_images 传 []，按 appearance 自由生成。名字不完全一致时按最接近的匹配，并在 details 注明匹配了哪个。
+   body 含中文用 node fetch 或 body.json（勿 curl -d 中文）。后端生成完自动写 character.image_url（一张含正/侧/背三视角的设定图）。分批触发降低限流。
+   轮询 GET /episodes/${EP}/characters 直到每个角色 image_url 有值。
+B. 场景图：GET /episodes/${EP}/scenes；对每个 POST /scenes/:id/generate-image {episode_id:${EP}}（后端用 scene.prompt 生成，Extract 已精准化）；轮询直到 scene.image_url 有值。
+失败逐个重试1次；仍失败记 warning 继续。返回 ok + 角色三视图/场景图成功计数。`,
   { phase: 'Images', label: 'images-assets', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
 
 // ============ Images-Gate：出图前质检（critic 审 image_prompt + reference 绑定，省钱闸门）============
@@ -406,7 +434,7 @@ ${JSON.stringify((lastFramePrompts.frames || []).map(f => ({ id: f.storyboard_id
 3. 对每镜：
    - 首帧：POST /images {storyboard_id, drama_id:${DRAMA}, prompt:"<image_prompt>, 竖屏9:16, cinematic, high quality", size:"1080x1920", frame_type:"first_frame", reference_images:["<该镜出场角色 image_url>","<场景 image_url>"]}
    - 尾帧：POST /images {storyboard_id, drama_id:${DRAMA}, prompt:"<该镜 last_prompt>, 竖屏9:16, cinematic, high quality", size:"1080x1920", frame_type:"last_frame", reference_images:[同首帧]}
-   reference_images 用 GET 结果里的 image_url（形如 static/images/xxx.png）。后端生成完自动写 storyboard.first_frame_image / last_frame_image。body 含中文用 node fetch 或 body.json。
+   reference_images 用 GET 结果里的 image_url（形如 static/images/xxx.png）。⚠️ 角色的 image_url 是【三视图设定图】（含正/侧/背三视角）——参考它保持人物外观跨镜一致，但每个镜头画面里【只呈现该镜头需要的单一视角】，不要把三个视角都画进同一镜头。场景的 image_url 是环境图，正常参考。后端生成完自动写 storyboard.first_frame_image / last_frame_image。body 含中文用 node fetch 或 body.json。
 4. 轮询 GET /episodes/${EP}/storyboards 直到每镜 first_frame_image 与 last_frame_image 都有值。
 失败逐个重试1次；尾帧实在失败的可记 warning 跳过（视频阶段会降级为仅首帧）。返回 ok + 首帧/尾帧成功计数。`,
   { phase: 'Images-Frames', label: 'images-frames', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
