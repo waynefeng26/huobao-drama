@@ -17,9 +17,13 @@ export class AliVideoAdapter implements VideoProviderAdapter {
     const baseUrl = config.baseUrl || 'https://dashscope.aliyuncs.com'
     const url = joinProviderUrl(baseUrl, '/api/v1', '/services/aigc/video-generation/video-synthesis')
 
+    // X-DashScope-Async: enable 强制异步任务模式。视频合成耗时长，账号默认不允许同步阻塞返回，
+    // 不带此 header 会被拒：403 "current user api does not support synchronous calls"。
+    // 带上后 Aliyun 返回 {output:{task_id, task_status:"PENDING"}}，由 parseGenerateResponse 走异步轮询。
     const headers: Record<string, string> = {
       'Authorization': `Bearer ${config.apiKey}`,
       'Content-Type': 'application/json',
+      'X-DashScope-Async': 'enable',
     }
 
     const body: any = {

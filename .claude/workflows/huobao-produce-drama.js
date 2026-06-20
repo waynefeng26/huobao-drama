@@ -1,6 +1,6 @@
 // ============================================================
 // 火宝短剧：原始剧本 → 一集成片 全自动工作流（v5：v4 基础 + 角色三视图设定图 + 结构化 appearance）
-// 复用方法：只改下面 SCRIPT_TITLE / STYLE / SCRIPT_TEXT 三个常量即可跑别的剧本。
+// 复用方法：只改下面 SCRIPT_TITLE / STYLE / SCRIPT_TEXT 三个常量即可跑别的剧本。可选配置：CHARACTER_REFERENCES（角色参考图）、VOICE_MAP（角色音色映射）。
 // ⚠️ 不要用 args 传剧本（本环境里 args 会变 undefined，v1 就是这么坏的）。
 // 依赖：火宝后端在 http://localhost:5679 运行，4 类 AI 服务已在「设置」配好。
 // 音频修复在后端 ffmpeg-compose.ts（无对白镜保留视频原生音轨），本工作流自动受益。
@@ -22,10 +22,18 @@
 //   POST /images 为每角色生成【三视图 character sheet】（正/侧/背三视角，自动写入 character.image_url），
 //   镜头首尾帧参考三视图保持人物跨镜一致（单镜只画单一视角）。不改后端——sheet 走 image_url；
 //   若要更精准的「正/侧/背分三张存 referenceImages」，需扩 PUT /characters 白名单 + 生成逻辑，留作后续。
+//
+// v6 修正（通用性 + 健壮性）：
+//   1) 消除闸门 prompt 中硬编码的剧本情节——critic 自行从 SCRIPT_TEXT 提取节拍评审完整性，换剧本不需改闸门。
+//   2) Extract 角色描述从硬编码改为格式模板+动态推导。
+//   3) 安全闸门增加质量分数最低门槛（MIN_QUALITY_SCORE），评分过低不进入视频阶段。
+//   4) 新增 VOICE_MAP 常量支持自定义角色音色映射。
+//   5) 修复 workbench URL 硬编码 episode/1 → episode/${EP}。
+//   6) gateSummary 保留 summary 字段；Images-Gate 命名修正。
 // ============================================================
 export const meta = {
   name: 'huobao-produce-drama',
-  description: '端到端驱动火宝后端，把一个原始剧本自动做成一集成片（改写→提取→音色→分镜→图→配音→视频→合成→导出），含三道质检闸门 + 回滚保护 + 首尾帧',
+  description: '端到端驱动火宝后端，把一个原始剧本自动做成一集成片（改写→提取→音色→分镜→图→配音→视频→合成→导出），含三道质检闸门 + 回滚保护 + 首尾帧 + v6 通用化',
   phases: [
     { title: 'Setup', detail: '建剧建集 + 写入原始内容' },
     { title: 'Rewrite', detail: 'script_rewriter 改写初版' },
@@ -35,7 +43,7 @@ export const meta = {
     { title: 'Storyboard', detail: 'storyboard_breaker 拆分镜（初版）' },
     { title: 'Storyboard-Gate', detail: '分镜质检闸门：critic→返工→分数回退则回滚' },
     { title: 'Images', detail: '角色三视图设定图（character sheet）+ 场景图' },
-    { title: 'Images-Gate', detail: '出图前质检：image_prompt + reference 绑定（省钱闸门）' },
+    { title: 'Images-Gate', detail: '帧图前质检：分镜 image_prompt + reference 绑定审查（在生成首尾帧之前）' },
     { title: 'Images-LastFrame-Prompt', detail: '为每镜推导尾帧 prompt（镜头结束画面）' },
     { title: 'Images-Frames', detail: '每镜生成首帧 + 尾帧（默认 first_last）' },
     { title: 'TTS', detail: '逐镜配音' },
@@ -60,6 +68,14 @@ const STYLE = 'cinematic'
 const CHARACTER_REFERENCES = {
   // '女骑手': ['static/refs/rider_face.jpg', 'static/refs/rider_outfit.jpg'],
   // '男骑手': ['static/refs/guy_ref.jpg'],
+}
+
+// ===== 角色音色映射（可选）：按「角色名 → 音色名」自定义，未配置的角色按性别默认分配 =====
+// 可用音色（经 chatfire→minimax 验证）：alloy, echo, fable, onyx, nova, shimmer
+// 默认：女性=shimmer, 男性=fable。多个同性别角色时建议手动区分。
+const VOICE_MAP = {
+  // '女骑手': 'shimmer',
+  // '男骑手': 'fable',
 }
 const SCRIPT_TEXT = '中国短发美女骑手驾驶摩托车，载着一个憨厚的中国年轻小伙（两人都没带头盔），在乡间土路上疾驰，突然年轻小伙发现前面有个深坑，惊讶的大喊，沟 沟 沟。随后短发女骑手加速喊道“收到， Go Go”。随后摩托车高速冲向深沟，女骑手一脸淡定，年轻小伙一脸惊讶，最后连人带车摔入沟底，激起大量沙尘。沙尘逐渐散去，两人坐在沟底满身尘土。女骑手率先开口询问："你刚说啥？"，男骑手气喘吁吁地回答："我说有沟啊！"'
 
@@ -141,6 +157,8 @@ const LASTFRAME_MAP = {
 
 // 返工上限：critic 最多评审 MAX_REWORK+1 次，rework 最多 MAX_REWORK 次。
 const MAX_REWORK = 2
+// 质量分数最低门槛：闸门评分低于此值则中止流水线，不进入视频阶段。
+// 根据实际效果调整：40 是宽松值，60 是严格值。（const MIN_QUALITY_SCORE 声明在安全闸门处）
 
 function common(dramaId, epId) {
   return `
@@ -260,7 +278,7 @@ ${SCRIPT_TEXT}
    a. 格式规范：是否有规范场景头（## S编号 | 内景/外景 · 地点 | 时间）？缺=high。
    b. 对白格式：对白是否「角色名：（状态/表情）台词」？格式错=medium；有剧情却无对白=medium。
    c. 节奏：每个场景约 30-60 秒内容？过短/过长=medium。
-   d. 完整性：是否完整覆盖原始素材所有关键情节（乡间土路疾驰 → 大叔发现深沟大喊"沟沟沟" → 女骑手加速"收到，Go Go" → 冲向深沟飞跃 → 连人带车摔入沟底扬尘 → 沙尘散去沟底对话"你刚说啥 / 我说有沟啊"）？漏关键情节=high。
+   d. 完整性：先从上面的原始素材中自行提取所有关键情节节拍（人物、动作、转折、台词），然后逐一检查 script_content 是否完整覆盖？漏任何关键情节=high。请在 issues 中列出你提取的节拍清单及覆盖情况。
    e. 可拍摄性：动作描写是否具体可视化（而非抽象概述）？过于抽象难拍=medium。
    f. 角色：出场角色与剧情是否一致、称呼统一？混乱=medium。
 3. 输出 schema：pass（无 high 即 true）/ score(0-100) / issues[{severity,storyboard_id填0,issue}] / fix_instructions（写给 script_rewriter 的完整修正要求；因 saveScript 是覆盖式，须给完整修正后的剧本要求而非只说改动）。
@@ -286,7 +304,7 @@ phase('Extract')
 const extract = await agent(`${common(DRAMA, EP)}
 任务：触发 extractor 提取角色与场景，然后把每角色 appearance 改写成【三视图友好】结构化描述、把场景 prompt 精准化（这是后续三视图与跨镜一致性的根基）。
 1. POST /agent/extractor/chat {message:"请从剧本中提取所有角色和场景信息，提取时自动与项目已有数据进行去重合并。每个场景的 prompt 请写完整：地点/时间段/光线/氛围/关键元素/色调。", drama_id:${DRAMA}, episode_id:${EP}}
-2. 核实：GET /episodes/${EP}/characters（应有2角色：女骑手、男骑手/青年大叔），GET /episodes/${EP}/scenes（应≥1场景）。
+2. 核实：GET /episodes/${EP}/characters（角色数应与剧本人物匹配），GET /episodes/${EP}/scenes（应≥1场景）。
 3. 【关键·三视图精准度】对每个角色，用 node JSON.stringify 构造 body（中文安全转义，勿 curl -d 中文），PUT /characters/:id {appearance:"<结构化外观>"}，把 appearance 改写成下面这个【三视图友好】格式——三视图=正/侧/背三个视角都要能锚定的固定特征，是跨镜一致性的命根子，每项要具体到能画出来：
    【整体】性别/年龄段/体型/身高感
    【头部】发型(长度/颜色/样式/分缝)、脸型、眉眼、肤色
@@ -294,9 +312,7 @@ const extract = await agent(`${common(DRAMA, EP)}
    【配色】主色/辅色（跨镜锚定用）
    【标记】疤痕/纹身/特殊特征（无则写"无"）
    【神态】默认气质表情
-   参考填充（基于剧本，按此精度）：
-   女骑手：【整体】年轻女性,20岁出头,矫健苗条,中等身高;【头部】利落黑色齐耳短发(自然分缝)、鹅蛋脸、浓眉亮眼、健康肤色;【服装】深色拉链机车皮夹克(黑)、黑色修身长裤、黑色马丁靴;【配色】主色黑/辅色暗银拉链;【标记】无;【神态】淡定自信。
-   男骑手(青年大叔):【整体】憨厚中年男性,35-45岁,微胖圆脸,中等偏矮;【头部】黑色寸头、圆脸、八字眉、偏黄肤色;【服装】旧军绿夹克(内格子衬衫)、深色长裤、旧布鞋;【配色】主色军绿/辅色灰;【标记】无;【神态】易惊讶、表情丰富。
+   请根据剧本内容和角色身份，为每个角色推导出符合上述格式的具体外观描述。要求：每项要具体到能画出来，不要写笼统的"普通打扮"。例如一个女骑手角色可填为：【整体】年轻女性,20岁出头,矫健苗条,中等身高;【头部】利落黑色齐耳短发(自然分缝)、鹅蛋脸、浓眉亮眼、健康肤色;【服装】深色拉链机车皮夹克(黑)、黑色修身长裤、黑色马丁靴;【配色】主色黑/辅色暗银拉链;【标记】无;【神态】淡定自信。请为本剧本的每个角色同样按此精度填写。
 4. 【场景精准化】GET /episodes/${EP}/scenes，对每个场景用 node JSON.stringify 构造 body，PUT /scenes/:id {prompt:"<精准场景描述>"}，prompt 含【地点/时间段/光线/氛围/关键元素/色调/镜头风格】且可视化。例：乡间土路场景 → "rural dirt road between fields, daytime, harsh sunlight, dry dust, deep ditch ahead, warm earth tones, cinematic wide establishing shot"。
 返回 ok + 角色数/场景数 + 角色 id 列表 + 每角色 appearance 字数。`,
   { phase: 'Extract', label: 'extract', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
@@ -307,10 +323,11 @@ const voice = await agent(`${common(DRAMA, EP)}
 任务：为角色分配【已验证可用】的音色，并用试听确认 TTS 链路通。
 背景：音色库 sync 在 chatfire 下不可用，但 OpenAI 风格音色名 {alloy,echo,fable,onyx,nova,shimmer} 经 chatfire→minimax 能正常合成（既有成片已验证：女=shimmer, 男=fable）。
 1. GET /episodes/${EP}/characters 拿角色列表。
-2. 直接分配（PUT /characters/:id {voice_style})：
-   - 女性角色 → voice_style:"shimmer"
-   - 男性角色 → voice_style:"fable"
-   （也可先跑 POST /agent/voice_assigner/chat {message:"请为所有角色分配合适的音色"}，但务必校正到 shimmer/fable。）
+2. 分配音色（PUT /characters/:id {voice_style}）：
+   【角色音色映射】：${JSON.stringify(VOICE_MAP)}
+   若映射中有该角色名（或近似匹配），使用映射指定的音色；否则按性别默认分配：女性→"shimmer"，男性→"fable"。
+   可用音色：alloy, echo, fable, onyx, nova, shimmer。
+   （也可先跑 POST /agent/voice_assigner/chat {message:"请为所有角色分配合适的音色"}，但务必校正到映射/默认音色。）
 3. 【TTS 可用性闸门】对一个角色 POST /characters/:id/generate-voice-sample {episode_id:${EP}}。
    成功（返回 voice_sample_url）= TTS 链路通；失败（404/voice 无效/key 问题）= ok:false 并把完整错误写进 details/warnings。本闸门失败会阻止后续烧钱的视频阶段，必须如实。
 全部角色已分配有效音色 + 试听成功才算 ok=true。`,
@@ -341,14 +358,14 @@ ${SCRIPT_TEXT}
 1. GET /episodes/${EP}/storyboards 拿全部分镜（每镜 id / image_prompt / video_prompt / dialogue / description / duration / shot_type / scene_id / character_ids）。
 2. GET /episodes/${EP}/characters 与 /scenes 拿角色（含 appearance）与场景，判断绑定正确性与跨镜一致性。
 3. 以【导演视角】逐镜评审，维度：
-   a. 完整性：分镜是否覆盖剧本所有关键转折？本例关键节拍是「乡间土路疾驰 → 大叔发现深沟大喊"沟沟沟" → 女骑手加速"收到，Go Go" → 冲向深沟飞跃 → 连人带车摔入沟底扬尘 → 沙尘散去沟底对话"你刚说啥 / 我说有沟啊"」。漏任一=high。
+   a. 完整性：先从上面原始剧本中自行提取所有关键转折节拍（动作、情绪转折、台词），然后逐一检查分镜是否覆盖？漏任一关键节拍=high。请在 issues 中列出节拍清单及覆盖情况。
    b. image_prompt 质量：每镜是否有清晰、英文为主、含构图/人物外貌/景别/光线/氛围的首帧描述（出图质量命根子）？空/纯中文/过笼统=high。
    c. video_prompt 质量：每镜是否有适配图生视频（Seedance，单镜4-12s）的动作描述？只静态无运动=medium；空=high。
    d. 对白格式：dialogue 是否「角色名：台词」？格式错或漏角色名=medium（纯动作镜可无对白）。
    e. 时长：每镜 duration 4-8 秒且合理？普遍>10s 或<3s=medium。
    f. 绑定：每镜是否绑定正确角色（character_ids）与场景（scene_id）？有对白却没绑说话角色=high。
-   g. 一致性：同一角色跨镜 image_prompt 是否与 appearance 一致（女骑手=年轻女性、黑色短发、机车皮夹克；男骑手=憨厚中年、寸头、旧夹克）？冲突=medium。
-   h. 数量与节奏：镜头数是否合理（本例预期 4-6 镜）？过碎或过冗=medium。
+   g. 一致性：同一角色跨镜 image_prompt 是否与其 appearance 字段一致？冲突=medium。
+   h. 数量与节奏：镜头数是否合理（短剧每集一般 4-8 镜）？过碎或过冗=medium。
 4. 输出 schema：pass（无 high 即 true）/ score(0-100) / issues[{severity,storyboard_id,issue}] / fix_instructions（逐镜可执行修正指令；因 saveStoryboards 覆盖式，须描述完整修正后的全部分镜而非只说改动）。
 只评审，绝不修改数据。`,
   reworkFor: (critique, attempt) => `${common(DRAMA, EP)}
@@ -382,12 +399,12 @@ B. 场景图：GET /episodes/${EP}/scenes；对每个 POST /scenes/:id/generate-
 失败逐个重试1次；仍失败记 warning 继续。返回 ok + 角色三视图/场景图成功计数。`,
   { phase: 'Images', label: 'images-assets', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
 
-// ============ Images-Gate：出图前质检（critic 审 image_prompt + reference 绑定，省钱闸门）============
+// ============ Images-Gate：帧图前质检（critic 审分镜 image_prompt + reference 绑定，在首尾帧生成之前）============
 phase('Images-Gate')
 const imagesGate = await qualityGate({
   tag: 'Images',
   criticFor: () => `${common(DRAMA, EP)}
-你是【出图前质检 / 评审美术】（reviewer agent），只读不写。出图很贵，本闸门在【烧图钱之前】审查 prompt 与 reference 是否完备——这是省钱+提质量的关键闸门。
+你是【帧图前质检 / 评审美术】（reviewer agent），只读不写。角色三视图与场景图已生成，本闸门在生成【分镜首尾帧】之前审查每镜的 image_prompt 与 reference 绑定是否完备——避免帧图质量差导致后续视频浪费。
 任务：
 1. GET /episodes/${EP}/storyboards 拿每镜 image_prompt / character_ids / scene_id / description。
 2. GET /episodes/${EP}/characters 与 /scenes，确认角色图 image_url 与场景图 image_url 都已生成（非空）。
@@ -395,7 +412,7 @@ const imagesGate = await qualityGate({
    a. image_prompt 完备：每镜 image_prompt 是否英文为主、含构图/人物外貌（与角色 appearance 一致）/景别/光线/9:16竖屏/cinematic 风格词？空/纯中文/过笼统/缺竖屏风格=high。
    b. reference 绑定：每镜是否绑定出场角色（character_ids）与场景（scene_id）？有角色出现却没绑=high；没绑场景=medium。
    c. 角色/场景图就绪：绑定的角色、场景是否都已有 image_url（否则生成时无参考）？缺=high。
-   d. 一致性：image_prompt 对角色外貌描述是否与 appearance 一致（女骑手黑短发机车夹克；男骑手憨厚寸头）？冲突=medium。
+   d. 一致性：image_prompt 对角色外貌描述是否与该角色的 appearance 字段一致？冲突=medium。
 4. 输出 schema：pass（无 high 即 true）/ score(0-100) / issues[{severity,storyboard_id,issue}] / fix_instructions（逐镜指令：哪些镜要 PUT 改 image_prompt、要补绑哪些 character_ids/scene_id；image_prompt 是单字段覆盖，指令须给完整新 image_prompt 文本）。
 只评审，绝不生成图、不修改数据。`,
   reworkFor: (critique, attempt) => `${common(DRAMA, EP)}
@@ -449,13 +466,23 @@ const tts = await agent(`${common(DRAMA, EP)}
 返回 ok + 成功/跳过计数。`,
   { phase: 'TTS', label: 'tts', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
 
-// ===== 安全闸门：前置若失败，绝不动视频（最贵）=====
+// ===== 安全闸门：前置若失败 / 质量过低，绝不动视频（最贵）=====
+const MIN_QUALITY_SCORE = 40
 const gateOk = rewrite.ok && extract.ok && voice.ok && storyboard.ok && imagesAssets.ok && framesGen.ok && tts.ok
-if (!gateOk) {
+const qualityScores = {
+  rewrite: rewriteGate?.critique?.score ?? 100,
+  storyboard: storyboardGate?.critique?.score ?? 100,
+  images: imagesGate?.critique?.score ?? 100,
+}
+const lowQuality = Object.entries(qualityScores).filter(([, s]) => s < MIN_QUALITY_SCORE)
+if (!gateOk || lowQuality.length > 0) {
   return {
     aborted: true,
-    reason: '前置阶段有失败（见各 phase.ok），为避免在视频阶段白花 API 费用，已中止。',
+    reason: !gateOk
+      ? '前置阶段有失败（见各 phase.ok），为避免在视频阶段白花 API 费用，已中止。'
+      : `质量闸门评分过低（${lowQuality.map(([k, s]) => `${k}:${s}`).join(', ')} < ${MIN_QUALITY_SCORE}），为避免低质量视频浪费费用，已中止。`,
     episodeId: EP, dramaId: DRAMA,
+    qualityScores,
     phases: { rewrite, rewriteGate, extract, voice, storyboard, storyboardGate, imagesAssets, imagesGate, lastFramePrompts, framesGen, tts },
   }
 }
@@ -496,7 +523,7 @@ const merge = await agent(`${common(DRAMA, EP)}
 
 function gateSummary(g) {
   return g && g.critique
-    ? { pass: g.critique.pass, score: g.critique.score, reworkRounds: g.reworkRounds, rolledBack: g.rolledBack, issues: g.critique.issues }
+    ? { pass: g.critique.pass, score: g.critique.score, summary: g.critique.summary, reworkRounds: g.reworkRounds, rolledBack: g.rolledBack, issues: g.critique.issues }
     : null
 }
 
@@ -509,5 +536,5 @@ return {
     images: gateSummary(imagesGate),
   },
   phases: { rewrite, rewriteGate, extract, voice, storyboard, storyboardGate, imagesAssets, imagesGate, lastFramePrompts, framesGen, tts, video, compose, merge },
-  workbench: `http://localhost:3013/drama/${DRAMA}/episode/1`,
+  workbench: `http://localhost:3013/drama/${DRAMA}/episode/${EP}`,
 }
