@@ -54,11 +54,15 @@ export const meta = {
 }
 
 // ===== 改这三个常量即可换剧本 =====
-const SCRIPT_TITLE = '摩托车飞跃深沟'
+const SCRIPT_TITLE = '飞跃深坑'
 // ⚠️ style 必须是前端下拉里的合法关键词之一（会被原样拼进宫格图 prompt）：
 //   realistic | anime | ghibli | cinematic | comic | watercolor
 //   写实+电影感打光 → cinematic；纯写实 → realistic。不要填中文自由文本。
 const STYLE = 'cinematic'
+
+// ===== 剧本类型与调性配置 =====
+const GENRE = 'comedy'
+const TONE = 'grounded Chinese rural humor, slapstick comedy, exaggerated facial expressions, fast-paced comedic timing, strong visual contrast'
 
 // ===== 角色参考图（可选）：想让某角色长得像指定图，把参考图放进 data/static/refs/，按「角色名 → [参考图路径]」配置 =====
 // 后端 Gemini adapter 会把参考图作为 inline_data 传给 Gemini 做图生图（gemini-image.ts），让角色贴合参考图。
@@ -77,7 +81,7 @@ const VOICE_MAP = {
   // '女骑手': 'shimmer',
   // '男骑手': 'fable',
 }
-const SCRIPT_TEXT = '中国短发美女骑手驾驶摩托车，载着一个憨厚的中国年轻小伙（两人都没带头盔），在乡间比值平坦的土路上疾驰，突然年轻小伙发现前面不远处的路中间被挖了个深坑，惊讶的大喊，沟 沟 沟。女骑手误听成的Go Go Go，随后短发女骑手加速喊道“收到， Go Go”，随后猛拧油门，摩托车高速冲向深沟，女骑手一脸淡定，年轻小伙一脸惊讶，最后连人带车摔入沟底，激起大量沙尘。沙尘逐渐散去，两人坐在沟底满身尘土。女骑手率先开口询问："你刚说啥？"，男骑手气喘吁吁地回答："我说有沟啊！"'
+const SCRIPT_TEXT = '中国短发美女驾驶摩托车，载着一个憨厚的中国年轻小伙，在乡间比值平坦的土路上疾驰，风姿煞爽。突然年轻小伙发现前面不远处的路中间被挖了个深坑，惊讶的大喊，沟 沟 沟。女骑手误听成的Go Go Go，随后短发女骑手加速喊道“收到， Go Go”，随后猛拧油门，摩托车高速冲向深沟，女骑手一脸淡定，年轻小伙一脸惊讶，最后连人带车摔入沟底，激起大量沙尘。沙尘逐渐散去，两人坐在沟底满身尘土。女骑手率先开口询问："你刚说啥？"，男骑手气喘吁吁地回答："我说有沟啊！"'
 
 const POLL = `
 轮询技巧（单次 Bash 不要超过 ~560 秒；需要就多调几次）：
@@ -256,7 +260,7 @@ if (!EP || !DRAMA) throw new Error('Setup 未返回有效 episodeId/dramaId: ' +
 phase('Rewrite')
 const rewrite = await agent(`${common(DRAMA, EP)}
 任务：触发 script_rewriter 改写并落库。
-1. POST /agent/script_rewriter/chat {message:"请读取剧本并改写为格式化剧本，然后保存", drama_id:${DRAMA}, episode_id:${EP}}  （阻塞 1-3 分钟）
+1. POST /agent/script_rewriter/chat {message:"请读取剧本并改写为格式化剧本，然后保存。\n\n【重要：剧本类型与调性约束】\n当前剧本类型为：${GENRE}\n调性要求：${TONE}\n\n请在改写时：\n1. 深度融入上述类型与调性。对于喜剧，请放大戏剧冲突，设计滑稽的动作描写与夸张的神态（如“瞪大眼睛”、“猛拧油门一脸淡定，与男主的惊恐形成强烈反差”），为后续分镜出图提供丰富的视觉线索。\n2. 确保所有场景头、动作描写和对白格式规范。\n3. 绝对保留剧本中的关键道具/载具（如“摩托车”），并在动作描写中明确强调，绝对不要泛化为“车辆”或“汽车”。", drama_id:${DRAMA}, episode_id:${EP}}  （阻塞 1-3 分钟）
 2. 核实：GET /dramas/${DRAMA}，该集 script_content 非空且【不是占位文本】。
 3. 若仍空：把 agent 返回 text 里干净的剧本文本，用 node JSON.stringify 构造 body，PUT /episodes/${EP} {script_content:<文本>} 手动写回，再核实。
 返回 ok + 剧本字数。`,
@@ -279,8 +283,9 @@ ${SCRIPT_TEXT}
    b. 对白格式：对白是否「角色名：（状态/表情）台词」？格式错=medium；有剧情却无对白=medium。
    c. 节奏：每个场景约 30-60 秒内容？过短/过长=medium。
    d. 完整性：先从上面的原始素材中自行提取所有关键情节节拍（人物、动作、转折、台词），然后逐一检查 script_content 是否完整覆盖？漏任何关键情节=high。请在 issues 中列出你提取的节拍清单及覆盖情况。
-   e. 可拍摄性：动作描写是否具体可视化（而非抽象概述）？过于抽象难拍=medium。
-   f. 角色：出场角色与剧情是否一致、称呼统一？混乱=medium。
+   e. 调性契合度：剧本改写是否完美融入了类型【${GENRE}】和调性【${TONE}】？如果喜剧效果平淡、缺乏生动的神态和滑稽动作描写=high。
+   f. 关键道具保留：剧本中是否保留并明确强调了核心道具/载具（如“摩托车”），是否发生了道具跑偏（如变成了汽车、泛化为车辆）？跑偏或丢失=high。
+   g. 角色：出场角色与剧情是否一致、称呼统一？混乱=medium。
 3. 输出 schema：pass（无 high 即 true）/ score(0-100) / issues[{severity,storyboard_id填0,issue}] / fix_instructions（写给 script_rewriter 的完整修正要求；因 saveScript 是覆盖式，须给完整修正后的剧本要求而非只说改动）。
 只评审，绝不修改数据。`,
   reworkFor: (critique, attempt) => `${common(DRAMA, EP)}
@@ -303,17 +308,17 @@ ${SCRIPT_TEXT}
 phase('Extract')
 const extract = await agent(`${common(DRAMA, EP)}
 任务：触发 extractor 提取角色与场景，然后把每角色 appearance 改写成【三视图友好】结构化描述、把场景 prompt 精准化（这是后续三视图与跨镜一致性的根基）。
-1. POST /agent/extractor/chat {message:"请从剧本中提取所有角色和场景信息，提取时自动与项目已有数据进行去重合并。每个场景的 prompt 请写完整：地点/时间段/光线/氛围/关键元素/色调。", drama_id:${DRAMA}, episode_id:${EP}}
+1. POST /agent/extractor/chat {message:"请从剧本中提取所有角色和场景信息，提取时自动与项目已有数据进行去重合并。请仔细分析剧本，提取本集最核心的道具或载具（例如“摩托车”），并将其融入到场景和角色特征中。每个场景的 prompt 请写完整：地点/时间段/光线/氛围/关键元素/色调，且必须包含核心道具的存在（如 speed on a motorcycle）。", drama_id:${DRAMA}, episode_id:${EP}}
 2. 核实：GET /episodes/${EP}/characters（角色数应与剧本人物匹配），GET /episodes/${EP}/scenes（应≥1场景）。
 3. 【关键·三视图精准度】对每个角色，用 node JSON.stringify 构造 body（中文安全转义，勿 curl -d 中文），PUT /characters/:id {appearance:"<结构化外观>"}，把 appearance 改写成下面这个【三视图友好】格式——三视图=正/侧/背三个视角都要能锚定的固定特征，是跨镜一致性的命根子，每项要具体到能画出来：
-   【整体】性别/年龄段/体型/身高感
-   【头部】发型(长度/颜色/样式/分缝)、脸型、眉眼、肤色
-   【服装】上装(款式/颜色/材质/领型)、下装、鞋、配饰(头盔?项链?眼镜?)
+   【整体】性别/年龄段/体型/人种特征（必须明确为 Chinese / East Asian，彻底消除欧美化）
+   【头部】发型(长度/颜色/样式/分缝)、脸型、眉眼、肤色（符合中国本土特征）
+   【服装】上装(款式/颜色/材质/领型)、下装、鞋、配饰（如：机车皮夹克、不戴头盔等，与核心载具/道具呼应）
    【配色】主色/辅色（跨镜锚定用）
-   【标记】疤痕/纹身/特殊特征（无则写"无"）
-   【神态】默认气质表情
-   请根据剧本内容和角色身份，为每个角色推导出符合上述格式的具体外观描述。要求：每项要具体到能画出来，不要写笼统的"普通打扮"。例如一个女骑手角色可填为：【整体】年轻女性,20岁出头,矫健苗条,中等身高;【头部】利落黑色齐耳短发(自然分缝)、鹅蛋脸、浓眉亮眼、健康肤色;【服装】深色拉链机车皮夹克(黑)、黑色修身长裤、黑色马丁靴;【配色】主色黑/辅色暗银拉链;【标记】无;【神态】淡定自信。请为本剧本的每个角色同样按此精度填写。
-4. 【场景精准化】GET /episodes/${EP}/scenes，对每个场景用 node JSON.stringify 构造 body，PUT /scenes/:id {prompt:"<精准场景描述>"}，prompt 含【地点/时间段/光线/氛围/关键元素/色调/镜头风格】且可视化。例：乡间土路场景 → "rural dirt road between fields, daytime, harsh sunlight, dry dust, deep ditch ahead, warm earth tones, cinematic wide establishing shot"。
+   //   【标记】特殊特征/随身道具（如：戴着防风眼镜，或无）
+   //   【神态】默认气质表情（喜剧角色需注明“带有喜感、憨厚或淡定”等表情特征）
+   请根据剧本内容和角色身份，为每个角色推导出符合上述格式的具体外观描述。要求：每项要具体到能画出来，不要写笼统的"普通打扮"。例如一个女骑手角色可填为：【整体】年轻女性,20岁出头,矫健苗条,中等身高,Chinese / East Asian;【头部】利落黑色齐耳短发(自然分缝)、鹅蛋脸、浓眉亮眼、健康肤色;【服装】深色拉链机车皮夹克(黑)、黑色修身长裤、黑色马丁靴;【配色】主色黑/辅色暗银拉链;【标记】无;【神态】淡定自信。请为本剧本的每个角色同样按此精度填写。
+4. 【场景精准化】GET /episodes/${EP}/scenes，对每个场景用 node JSON.stringify 构造 body，PUT /scenes/:id {prompt:"<精准场景描述>"}，prompt 含【地点/时间段/光线/氛围/关键元素/色调/镜头风格】且可视化，必须包含核心道具（如 motorcycle）和中国乡村/都市文化背景。例：乡间土路场景 → "rural dirt road in China, daytime, harsh sunlight, dry dust, deep ditch ahead, a motorcycle kicked up dust, warm earth tones, cinematic wide establishing shot"。
 返回 ok + 角色数/场景数 + 角色 id 列表 + 每角色 appearance 字数。`,
   { phase: 'Extract', label: 'extract', agentType: 'general-purpose', schema: STATUS, effort: 'medium' })
 
@@ -337,7 +342,7 @@ const voice = await agent(`${common(DRAMA, EP)}
 phase('Storyboard')
 const storyboard = await agent(`${common(DRAMA, EP)}
 任务：触发 storyboard_breaker 拆分镜。
-1. POST /agent/storyboard_breaker/chat {message:"请拆解分镜并生成视频提示词。视频模型：doubao-seedance-1-5-pro-251215（火山 Seedance 图生视频，单镜 4-12 秒）。请据此生成合适的 video_prompt，并为每个镜头生成静态首帧用的 image_prompt（英文为主，描述构图、人物、景别），每个镜头绑定对应角色与场景，时长 4-8 秒。", drama_id:${DRAMA}, episode_id:${EP}}
+1. POST /agent/storyboard_breaker/chat {message:"请拆解分镜并生成视频提示词。视频模型：doubao-seedance-1-5-pro-251215（火山 Seedance 图生视频，单镜 4-12 秒）。\n\n【重要分镜设计约束】\n1. 喜剧节奏与单人镜头优先：喜剧非常依赖角色表情反差（如女骑手淡定与男小伙惊恐）。请尽量多设计【单人近景/特写镜头】（如“镜头3：男小伙面部特写，双眼瞪大，极度惊恐大喊”；“镜头4：女骑手侧面近景，一脸淡定，猛拧油门”）。避免设计过多复杂的双人同框高动态镜头，单人镜头能保证 100% 角色一致性且绝不串乱。\n2. 英文提示词（image_prompt）强锁定：每一镜的 image_prompt 必须是英文，且【开头前三个词】必须明确人种和核心载具。例如：必须写 \"A Chinese young woman riding a red motorcycle...\"，绝对不允许使用 generic 词汇（如 \"A person driving a vehicle\"）。必须在提示词中加入风格词：竖屏9:16、cinematic、high quality。\n3. 确保 dialogue 格式严格为“角色名：台词”，纯动作镜可无对白。\n4. 时长 4-8 秒，绑定对应角色与场景。", drama_id:${DRAMA}, episode_id:${EP}}
 2. 核实：GET /episodes/${EP}/storyboards，镜头数>0（预期 4-6 镜）。
 3. 每镜都应有 image_prompt 与 video_prompt；空字段用 PUT /storyboards/:id 补。
 4. 确保 dialogue 格式为 "角色名：台词"（如 "女骑手：你刚说啥？"），便于 TTS 按角色取音色。纯动作镜（摔车）可无对白。
@@ -360,12 +365,14 @@ ${SCRIPT_TEXT}
 3. 以【导演视角】逐镜评审，维度：
    a. 完整性：先从上面原始剧本中自行提取所有关键转折节拍（动作、情绪转折、台词），然后逐一检查分镜是否覆盖？漏任一关键节拍=high。请在 issues 中列出节拍清单及覆盖情况。
    b. image_prompt 质量：每镜是否有清晰、英文为主、含构图/人物外貌/景别/光线/氛围的首帧描述（出图质量命根子）？空/纯中文/过笼统=high。
-   c. video_prompt 质量：每镜是否有适配图生视频（Seedance，单镜4-12s）的动作描述？只静态无运动=medium；空=high。
-   d. 对白格式：dialogue 是否「角色名：台词」？格式错或漏角色名=medium（纯动作镜可无对白）。
-   e. 时长：每镜 duration 4-8 秒且合理？普遍>10s 或<3s=medium。
-   f. 绑定：每镜是否绑定正确角色（character_ids）与场景（scene_id）？有对白却没绑说话角色=high。
-   g. 一致性：同一角色跨镜 image_prompt 是否与其 appearance 字段一致？冲突=medium。
-   h. 数量与节奏：镜头数是否合理（短剧每集一般 4-8 镜）？过碎或过冗=medium。
+   c. 种族与道具强锁定（硬性指标）：涉及人的镜头 image_prompt 是否在开头明确写了 \"Chinese\" 或 \"East Asian\"？涉及载具的镜头是否 100% 出现了具体的载具词（如 \"motorcycle\"）？如果出现 \"car\"、\"vehicle\" 或未提及，直接判定为 high 严重度。
+   d. 喜剧节奏与镜头比例：是否优先采用了单人特写/近景镜头来展现喜剧反差？如果全是大全景或复杂的双人同框动镜头=medium。
+   e. video_prompt 质量：每镜是否有适配图生视频（Seedance，单镜4-12s）的动作描述？只静态无运动=medium；空=high。
+   f. 对白格式：dialogue 是否「角色名：台词」？格式错或漏角色名=medium（纯动作镜可无对白）。
+   g. 时长：每镜 duration 4-8 秒且合理？普遍>10s 或<3s=medium。
+   h. 绑定：每镜是否绑定正确角色（character_ids）与场景（scene_id）？有对白却没绑说话角色=high。
+   i. 一致性：同一角色跨镜 image_prompt 是否与其 appearance 字段一致？冲突=medium。
+   j. 数量与节奏：镜头数是否合理（短剧每集一般 4-8 镜）？过碎或过冗=medium。
 4. 输出 schema：pass（无 high 即 true）/ score(0-100) / issues[{severity,storyboard_id,issue}] / fix_instructions（逐镜可执行修正指令；因 saveStoryboards 覆盖式，须描述完整修正后的全部分镜而非只说改动）。
 只评审，绝不修改数据。`,
   reworkFor: (critique, attempt) => `${common(DRAMA, EP)}
@@ -409,7 +416,7 @@ const imagesGate = await qualityGate({
 1. GET /episodes/${EP}/storyboards 拿每镜 image_prompt / character_ids / scene_id / description。
 2. GET /episodes/${EP}/characters 与 /scenes，确认角色图 image_url 与场景图 image_url 都已生成（非空）。
 3. 逐镜评审，维度：
-   a. image_prompt 完备：每镜 image_prompt 是否英文为主、含构图/人物外貌（与角色 appearance 一致）/景别/光线/9:16竖屏/cinematic 风格词？空/纯中文/过笼统/缺竖屏风格=high。
+   a. image_prompt 完备与强锁定（硬性指标）：每镜 image_prompt 是否英文为主、含构图/人物外貌（与角色 appearance 一致）/景别/光线/9:16竖屏/cinematic 风格词？涉及人的镜头是否在开头明确写了 \"Chinese\" 或 \"East Asian\"？涉及载具的镜头是否 100% 出现了具体的载具词（如 \"motorcycle\"）？如果出现 \"car\"、\"vehicle\" 或未提及，直接判定为 high 严重度。
    b. reference 绑定：每镜是否绑定出场角色（character_ids）与场景（scene_id）？有角色出现却没绑=high；没绑场景=medium。
    c. 角色/场景图就绪：绑定的角色、场景是否都已有 image_url（否则生成时无参考）？缺=high。
    d. 一致性：image_prompt 对角色外貌描述是否与该角色的 appearance 字段一致？冲突=medium。
@@ -445,12 +452,26 @@ const lastFramePrompts = await agent(`${common(DRAMA, EP)}
 phase('Images-Frames')
 const framesGen = await agent(`${common(DRAMA, EP)}
 任务：为每个镜头生成【首帧 + 尾帧】两张图（默认首尾帧模式；视频走 Seedance first_last 在两帧间插值，运动更可控）。
-1. GET /episodes/${EP}/storyboards 拿每镜 id / image_prompt / character_ids / scene_id；GET /episodes/${EP}/characters 与 /scenes 拿角色图/场景图 image_url。
+
+【核心算法：主角色隔离参考算法（彻底解决多角色串乱问题）】
+在为每个镜头生成首尾帧调用 POST /images 时，请在你的 Node 脚本中实现以下 reference_images 绑定逻辑：
+1. 遍历每个分镜，获取其绑定的 character_ids 数组。
+2. 如果 character_ids 长度等于 1：
+   - reference_images 正常传入该角色的三视图 image_url 和场景的 image_url。
+3. 如果 character_ids 长度大于 1（多角色同框）：
+   - 识别本镜的主角（说话者或动作主体）：
+     - 优先检查分镜的 dialogue 字段是否包含“角色名：”。如果包含，选择该说话的角色作为 main_character_id。
+     - 如果 dialogue 为空或未匹配到角色名，则默认选择 character_ids 数组中的第一个角色作为 main_character_id。
+   - 【物理隔离】：在调用 POST /images 时，reference_images 数组中【仅传入 main_character_id 的三视图 image_url】和场景的 image_url。
+   - 【文本补充】：对于未传入参考图的配角，不要将其三视图放入 reference_images，而是确保在 prompt 中通过英文文本精准描述其外貌特征（如 with a chubby Chinese young man sitting behind her），防止 Gemini 混淆多张参考图。
+
+执行步骤：
+1. GET /episodes/${EP}/storyboards 拿每镜 id / image_prompt / character_ids / scene_id / dialogue；GET /episodes/${EP}/characters 与 /scenes 拿角色图/场景图 image_url。
 2. 尾帧 prompt 映射（storyboard_id → last_prompt）：
 ${JSON.stringify((lastFramePrompts.frames || []).map(f => ({ id: f.storyboard_id, last_prompt: f.last_prompt })))}
-3. 对每镜：
-   - 首帧：POST /images {storyboard_id, drama_id:${DRAMA}, prompt:"<image_prompt>, 竖屏9:16, cinematic, high quality", size:"1080x1920", frame_type:"first_frame", reference_images:["<该镜出场角色 image_url>","<场景 image_url>"]}
-   - 尾帧：POST /images {storyboard_id, drama_id:${DRAMA}, prompt:"<该镜 last_prompt>, 竖屏9:16, cinematic, high quality", size:"1080x1920", frame_type:"last_frame", reference_images:[同首帧]}
+3. 对每镜，按上述【主角色隔离参考算法】计算出 reference_images 数组：
+   - 首帧：POST /images {storyboard_id, drama_id:${DRAMA}, prompt:"<image_prompt>, 竖屏9:16, cinematic, high quality", size:"1080x1920", frame_type:"first_frame", reference_images:[<计算出的参考图数组>]}
+   - 尾帧：POST /images {storyboard_id, drama_id:${DRAMA}, prompt:"<该镜 last_prompt>, 竖屏9:16, cinematic, high quality", size:"1080x1920", frame_type:"last_frame", reference_images:[<计算出的参考图数组>]}
    reference_images 用 GET 结果里的 image_url（形如 static/images/xxx.png）。⚠️ 角色的 image_url 是【三视图设定图】（含正/侧/背三视角）——参考它保持人物外观跨镜一致，但每个镜头画面里【只呈现该镜头需要的单一视角】，不要把三个视角都画进同一镜头。场景的 image_url 是环境图，正常参考。后端生成完自动写 storyboard.first_frame_image / last_frame_image。body 含中文用 node fetch 或 body.json。
 4. 轮询 GET /episodes/${EP}/storyboards 直到每镜 first_frame_image 与 last_frame_image 都有值。
 失败逐个重试1次；尾帧实在失败的可记 warning 跳过（视频阶段会降级为仅首帧）。返回 ok + 首帧/尾帧成功计数。`,
