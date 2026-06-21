@@ -70,7 +70,7 @@ const TONE = 'grounded Chinese rural humor, slapstick comedy, exaggerated facial
 // 角色名要与 Extract 提取的 name 一致（如「女骑手」「男骑手」）；未配置的角色按结构化 appearance 自由生成。
 // 默认空对象 = 全部角色自由生成，不加参考图。
 const CHARACTER_REFERENCES = {
-  // '女骑手': ['static/refs/rider_face.jpg', 'static/refs/rider_outfit.jpg'],
+  '美女': ['static/refs/meinv.jpg'],
   // '男骑手': ['static/refs/guy_ref.jpg'],
 }
 
@@ -81,7 +81,7 @@ const VOICE_MAP = {
   // '女骑手': 'shimmer',
   // '男骑手': 'fable',
 }
-const SCRIPT_TEXT = '中国短发美女驾驶摩托车，载着一个憨厚的中国年轻小伙，在乡间比值平坦的土路上疾驰，风姿煞爽。突然年轻小伙发现前面不远处的路中间被挖了个深坑，惊讶的大喊，沟 沟 沟。女骑手误听成的Go Go Go，随后短发女骑手加速喊道“收到， Go Go”，随后猛拧油门，摩托车高速冲向深沟，女骑手一脸淡定，年轻小伙一脸惊讶，最后连人带车摔入沟底，激起大量沙尘。沙尘逐渐散去，两人坐在沟底满身尘土。女骑手率先开口询问："你刚说啥？"，男骑手气喘吁吁地回答："我说有沟啊！"'
+const SCRIPT_TEXT = '中国短发美女驾驶摩托车，载着一个憨厚的中国年轻小伙，在乡间比值平坦的土路上疾驰，风姿煞爽。突然年轻小伙发现前面不远处的路中间被挖了个深坑，惊讶的大喊，沟 沟 沟。美女误听成的Go Go Go，随后短发美女加速喊道“收到， Go Go”，随后猛拧油门，摩托车高速冲向深坑，美女一脸淡定，年轻小伙一脸惊讶，最后连人带车摔入坑底，激起大量沙尘。沙尘逐渐散去，两人坐在坑底满身尘土。美女率先开口询问："你刚说啥？"，男骑手气喘吁吁地回答："我说有沟啊！"'
 
 const POLL = `
 轮询技巧（单次 Bash 不要超过 ~560 秒；需要就多调几次）：
